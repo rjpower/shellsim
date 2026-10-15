@@ -25,6 +25,7 @@ pub mod harness_manager;
 pub mod hashes;
 pub mod host_ingest;
 pub mod interp;
+pub mod interruption;
 pub mod jqcmd;
 pub mod mcp;
 pub mod net;
@@ -49,6 +50,7 @@ pub use clock::{
     BlockOutcome, EventId, EventKind, ScheduledEvent, Timeline, TimelineError, TimelineLimits,
 };
 pub use interp::{Environment, Interp, ProcessState};
+pub use interruption::CancellationToken;
 pub use profile::EnvironmentProfile;
 pub use resources::{Limits, RunOutcome, StopReason, Usage};
 pub use telemetry::{CommandTrust, InvocationEvent};

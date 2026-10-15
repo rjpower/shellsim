@@ -13,6 +13,7 @@ if TYPE_CHECKING:
     from ._api import (
         Action,
         ActionPoll,
+        CancellationToken,
         CommandUsage,
         Container,
         Context,
@@ -38,6 +39,7 @@ if TYPE_CHECKING:
 __all__ = [
     "Action",
     "ActionPoll",
+    "CancellationToken",
     "CommandUsage",
     "Container",
     "Context",

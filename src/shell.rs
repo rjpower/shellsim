@@ -238,6 +238,7 @@ enum Tok {
 
 struct Lexer {
     chars: Vec<char>,
+    cancellation: Option<crate::CancellationToken>,
     i: usize,
     toks: Vec<Tok>,
     in_double_bracket: bool,
@@ -249,6 +250,7 @@ impl Lexer {
     fn new(src: &str) -> Self {
         Lexer {
             chars: src.chars().collect(),
+            cancellation: None,
             i: 0,
             toks: Vec::new(),
             in_double_bracket: false,
@@ -258,7 +260,15 @@ impl Lexer {
     }
 
     fn peek(&self) -> Option<char> {
-        self.chars.get(self.i).copied()
+        if self
+            .cancellation
+            .as_ref()
+            .is_some_and(crate::CancellationToken::is_cancelled)
+        {
+            None
+        } else {
+            self.chars.get(self.i).copied()
+        }
     }
     fn at(&self, o: usize) -> Option<char> {
         self.chars.get(self.i + o).copied()
@@ -913,6 +923,7 @@ impl Lexer {
 
 struct Parser {
     toks: Vec<Tok>,
+    cancellation: Option<crate::CancellationToken>,
     i: usize,
     error: Option<ShellError>,
     /// Depth of the syntax tree under construction, bounded by [`MAX_SYNTAX_DEPTH`].
@@ -955,6 +966,7 @@ impl Parser {
     fn new(toks: Vec<Tok>) -> Self {
         Parser {
             toks,
+            cancellation: None,
             i: 0,
             error: None,
             depth: 0,
@@ -962,11 +974,19 @@ impl Parser {
     }
 
     fn peek(&self) -> &Tok {
-        self.toks.get(self.i).unwrap_or(&Tok::Eof)
+        if self
+            .cancellation
+            .as_ref()
+            .is_some_and(crate::CancellationToken::is_cancelled)
+        {
+            &Tok::Eof
+        } else {
+            self.toks.get(self.i).unwrap_or(&Tok::Eof)
+        }
     }
 
     fn next(&mut self) -> Tok {
-        let t = self.toks.get(self.i).cloned().unwrap_or(Tok::Eof);
+        let t = self.peek().clone();
         self.i += 1;
         t
     }
@@ -1811,11 +1831,21 @@ impl Node {}
 
 /// Parse a complete shell action without executing any partial syntax tree.
 pub fn parse(src: &str) -> Result<Node, ShellError> {
-    let (toks, _, lexer_error) = Lexer::new(src).tokenize();
+    parse_with_cancellation(src, None)
+}
+
+fn parse_with_cancellation(
+    src: &str,
+    cancellation: Option<crate::CancellationToken>,
+) -> Result<Node, ShellError> {
+    let mut lexer = Lexer::new(src);
+    lexer.cancellation = cancellation.clone();
+    let (toks, _, lexer_error) = lexer.tokenize();
     if let Some(error) = lexer_error {
         return Err(error);
     }
     let mut p = Parser::new(toks);
+    p.cancellation = cancellation;
     let node = p.parse_program();
     if p.error.is_none() && !matches!(p.peek(), Tok::Eof) {
         p.expected("end of input");
@@ -1879,6 +1909,11 @@ impl Interp {
         if let Some(status) = self.termination_status() {
             return (self.outcome(status), out, err);
         }
+        if self.interrupted() {
+            let mut outcome = self.outcome(130);
+            outcome.interrupted = true;
+            return (outcome, out, err);
+        }
         let code = match self.parse_shell_action(src) {
             Ok(ast) => crate::exec::exec(self, &ast, stdin, &mut out, &mut err),
             Err((status, diagnostic)) => {
@@ -1887,7 +1922,9 @@ impl Interp {
             }
         };
         let status = self.exiting.unwrap_or(code);
-        (self.outcome(status), out, err)
+        let mut outcome = self.outcome(status);
+        outcome.interrupted = self.cancellation.interrupted.get();
+        (outcome, out, err)
     }
 
     /// Parse one complete action under the shared deterministic parser budget.
@@ -1900,8 +1937,13 @@ impl Interp {
                 .map_or(137, |reason| reason.exit_status());
             return Err((status, Vec::new()));
         }
+        let cancellation = self.cancellation.token.clone().filter(|_| {
+            self.cancellation
+                .generation
+                .is_none_or(|generation| self.process.action_generation == generation)
+        });
         let parsed = if self.resources.charge_cpu(src.len() as u64) {
-            parse(src)
+            parse_with_cancellation(src, cancellation)
                 .map_err(|error| (2, format!("shellsim: syntax error: {error}\n").into_bytes()))
         } else {
             Err((
@@ -1912,6 +1954,11 @@ impl Interp {
             ))
         };
         self.resources.release_memory(parser_memory);
+        // Cancellation may end lexing at EOF; never execute that partial syntax tree.
+        if self.interrupted() {
+            self.cancellation.interrupted.set(true);
+            return Err((130, Vec::new()));
+        }
         if let Err((status, _)) = &parsed {
             self.last_status = *status;
         }

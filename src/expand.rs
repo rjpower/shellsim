@@ -133,9 +133,12 @@ struct Part {
 /// Charge `bytes` of expansion output to the machine memory budget before it is used.
 ///
 /// The charge lasts until the next shell node starts (see
-/// [`Interp::release_expansion_memory`]). On failure the machine stops with
-/// `MemoryExhausted` and expansion produces nothing further.
+/// [`Interp::release_expansion_memory`]). Memory exhaustion stops the machine;
+/// cancellation stops only this action. Either case suppresses further expansion.
 fn charge_expansion(interp: &mut Interp, bytes: usize) -> bool {
+    if interp.interrupted() {
+        return false;
+    }
     let bytes = bytes as u64;
     if !interp.resources.reserve_memory(bytes) {
         return false;
@@ -1021,7 +1024,8 @@ fn apply_param_op(
                 usize::from(v.contains(pat.as_str()))
             };
             let growth = rep.len().saturating_sub(pat.len()).saturating_mul(matches);
-            if !interp.resources.charge_cpu(v.len() as u64)
+            if interp.interrupted()
+                || !interp.resources.charge_cpu(v.len() as u64)
                 || !charge_expansion(interp, v.len().saturating_add(growth))
             {
                 return String::new();
@@ -1279,7 +1283,7 @@ fn glob_vfs(interp: &mut Interp, pattern: &str) -> Vec<String> {
                 if let Ok(entries) = interp.vfs.list_dir("/", dir) {
                     // Listing and matching cost one unit per entry, plus the pattern compile.
                     let work = entries.len().saturating_add(comp.len());
-                    if !interp.resources.charge_cpu(work as u64) {
+                    if interp.interrupted() || !interp.resources.charge_cpu(work as u64) {
                         return Vec::new();
                     }
                     let re = regex::Regex::new(&glob_to_regex(comp)).ok();

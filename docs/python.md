@@ -19,6 +19,40 @@ Python installed. `run_python` passes arguments and standard input directly to
 the guest; each invocation starts a fresh interpreter and preserves the VFS.
 `env.install_pypi(...)` can add packages from the Context's catalog.
 
+Pass a new `CancellationToken` to `Environment.run`, `ShellSession.run`, or
+`run_python` to let another host thread interrupt that action. The token never
+takes the environment's execution lock. For example, a host can cancel a worker
+after its own deadline and wait for cleanup:
+
+```python
+from concurrent.futures import ThreadPoolExecutor, TimeoutError
+
+token = shellsim.CancellationToken()
+with ThreadPoolExecutor(max_workers=1) as worker:
+    pending = worker.submit(env.run, "while :; do :; done", cancellation=token)
+    try:
+        result = pending.result(timeout=1)
+    except TimeoutError:
+        token.cancel()
+        result = pending.result()
+assert result.interrupted and result.returncode == 130
+```
+
+An interrupted action preserves existing files and shell state, unwinds function
+locals and redirections, and stops processes started by that action. Older
+background jobs survive. Interruption alone leaves the environment usable and
+keeps cumulative resource usage; `stop_reason` continues to report permanent
+resource exhaustion. Tokens bind once; requests after completion have no effect.
+Container actions retain their `Action.stop()` interface and use the same cleanup.
+
+Cancellation is cooperative at scheduler, Wasm fuel, and native work checkpoints.
+Real-time waits wake on cancellation. Compilation, allocation and an individual
+native library call must return before the next checkpoint; a compilation-cache
+miss can therefore delay interruption. No guest capability observes the host's
+deadline or cancellation token.
+An older job already running a native step must yield before the foreground
+driver can act on cancellation; its work does not consume the new action's token.
+
 Context owns the catalog snapshot and local download/module caches. Environments
 with the same package selection share an immutable installation and keep their
 writes private. `cache_dir`, `offline` and `trusted_precompiled` belong to Context;

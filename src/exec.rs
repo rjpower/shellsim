@@ -29,7 +29,11 @@ pub fn exec(
             Ok(MachinePoll::Progress) => {}
             Ok(MachinePoll::Blocked) => {
                 if let Some(wait) = interp.host_wait_until() {
-                    std::thread::sleep(wait);
+                    if let Some(token) = &interp.cancellation.token {
+                        token.wait(wait);
+                    } else {
+                        std::thread::sleep(wait);
+                    }
                     continue;
                 }
                 err.extend_from_slice(b"shellsim: all processes are blocked without an event\n");
@@ -51,6 +55,7 @@ pub fn exec(
 #[derive(Clone)]
 pub(crate) struct ShellExecution {
     target_pid: u32,
+    generation: u64,
     saved: crate::descriptors::FdTable,
     stdin: crate::descriptors::DescriptionId,
     stdout: crate::descriptors::DescriptionId,
@@ -66,6 +71,12 @@ impl ShellExecution {
         stdin: &[u8],
         stdin_closed: bool,
     ) -> Result<Self, String> {
+        let generation = interp.next_action_generation;
+        interp.next_action_generation = generation
+            .checked_add(1)
+            .ok_or_else(|| "action generation exhausted".to_string())?;
+        interp.process.action_generation = generation;
+        interp.cancellation.generation = Some(generation);
         let saved = interp
             .process
             .fds
@@ -107,6 +118,7 @@ impl ShellExecution {
         };
         Ok(Self {
             target_pid,
+            generation,
             saved,
             stdin: input,
             stdout,
@@ -124,7 +136,149 @@ impl ShellExecution {
         interp: &mut Interp,
         advance_time: bool,
     ) -> Result<MachinePoll, String> {
-        poll_machine(interp, self.target_pid, advance_time)
+        if interp.cancellation_requested() {
+            interp.cancellation.interrupted.set(true);
+            return self.cancel(interp, 130).map(MachinePoll::Ready);
+        }
+        let progress = poll_machine(interp, self.target_pid, advance_time)?;
+        // Completion wins a late request unless native work observed it inside this quantum.
+        if matches!(progress, MachinePoll::Ready(_)) && !interp.cancellation.interrupted.get() {
+            return Ok(progress);
+        }
+        if interp.cancellation_requested() {
+            interp.cancellation.interrupted.set(true);
+            self.cancel(interp, 130).map(MachinePoll::Ready)
+        } else {
+            Ok(progress)
+        }
+    }
+
+    /// Stop only this action's descendants and unwind its retained shell without exiting it.
+    ///
+    /// The root is parked while descendants consume their pending kill signals, so no further
+    /// user command can run during cleanup. Older background jobs and other sessions survive.
+    /// If bounded reaping fails, pending kills are delivered when a later action schedules them.
+    pub(crate) fn cancel(&mut self, interp: &mut Interp, status: i32) -> Result<i32, String> {
+        const MAX_CANCEL_QUANTA: usize = 100_000;
+        self.cancel_with_budget(interp, status, MAX_CANCEL_QUANTA)
+    }
+
+    fn cancel_with_budget(
+        &mut self,
+        interp: &mut Interp,
+        status: i32,
+        budget: usize,
+    ) -> Result<i32, String> {
+        // Reaping polls use the same method; detaching the token prevents recursive cancellation
+        // and keeps resource release and scope restoration independent of the host request.
+        let token = interp.cancellation.token.take();
+        let reaped = (|| {
+            let _ = self.close_stdin(interp);
+            let children = interp
+                .process
+                .action_members(self.generation)
+                .into_iter()
+                .filter(|pid| *pid != self.target_pid)
+                .collect::<Vec<_>>();
+            interp
+                .scheduler
+                .stop(self.target_pid)
+                .map_err(|error| format!("{error:?}"))?;
+            for pid in &children {
+                interp.send_signal(*pid, crate::process::Signal::Kill)?;
+            }
+            let mut completed = false;
+            for _ in 0..budget {
+                if children.iter().all(|pid| {
+                    interp.processes.get(*pid).is_none_or(|record| {
+                        matches!(record.status, crate::process::ProcessStatus::Exited(_))
+                    })
+                }) {
+                    completed = true;
+                    break;
+                }
+                // Unrelated jobs may be runnable, including native bodies that do not yield.
+                // Dispatch only a victim: its pending kill is handled before any user code.
+                if interp
+                    .scheduler
+                    .current()
+                    .is_some_and(|pid| !children.contains(&pid))
+                {
+                    interp
+                        .scheduler
+                        .yield_current()
+                        .map_err(|error| format!("{error:?}"))?;
+                }
+                if interp.scheduler.current().is_none() {
+                    let pid = children
+                        .iter()
+                        .copied()
+                        .find(|pid| {
+                            matches!(
+                                interp.scheduler.state(*pid),
+                                Some(crate::scheduler::TaskState::Runnable)
+                            )
+                        })
+                        .ok_or_else(|| "no runnable cancellation victim".to_string())?;
+                    interp
+                        .scheduler
+                        .dispatch_pid(pid)
+                        .map_err(|error| format!("{error:?}"))?;
+                    interp.process.activate(pid)?;
+                }
+                if self.poll(interp, false)? == MachinePoll::Blocked {
+                    return Err("descendants blocked during cancellation".to_string());
+                }
+            }
+            if !completed {
+                return Err("cancellation exceeded its work bound".to_string());
+            }
+            Ok(())
+        })();
+        // Restore the shell even if descendant cleanup failed. Its caller must still be able
+        // to collect output and release the action descriptors before reporting that error.
+        let restored: Result<i32, String> = (|| {
+            if interp.scheduler.current().is_some() {
+                interp
+                    .scheduler
+                    .yield_current()
+                    .map_err(|error| format!("{error:?}"))?;
+            }
+            interp
+                .scheduler
+                .continue_task(self.target_pid)
+                .map_err(|error| format!("{error:?}"))?;
+            interp.processes.continue_process(self.target_pid);
+            interp
+                .scheduler
+                .wake(self.target_pid)
+                .map_err(|error| format!("{error:?}"))?;
+            interp
+                .scheduler
+                .dispatch_pid(self.target_pid)
+                .map_err(|error| format!("{error:?}"))?;
+            interp.process.activate(self.target_pid)?;
+            if let Some(mut program) = interp.process.program.take() {
+                program.terminate(interp);
+            }
+            interp.clock.cancel_task_events(u64::from(self.target_pid));
+            interp.release_exec_metadata();
+            interp.release_expansion_memory();
+            interp.invocations.finish_process(
+                self.target_pid,
+                status,
+                interp.resources.cpu_used(),
+                interp.vfs.disk_used(),
+            );
+            interp.exiting = None;
+            interp.last_status = status;
+            interp.net.discard_host_requests();
+            Ok(status)
+        })();
+        interp.cancellation.token = token;
+        let status = restored?;
+        reaped?;
+        Ok(status)
     }
 
     /// Append bounded action input and wake only tasks waiting on this description.
@@ -179,6 +333,29 @@ impl ShellExecution {
     pub(crate) fn restore(self, interp: &mut Interp) {
         restore_fds(interp, self.saved);
     }
+}
+
+/// Check ancestry as well as PID age so an old background job cannot delegate a new child.
+pub(crate) fn process_belongs_to_action(
+    processes: &crate::process::ProcessTable,
+    pid: u32,
+    root_pid: u32,
+    first_new_pid: u32,
+) -> bool {
+    let mut current = pid;
+    while current != root_pid {
+        if current < first_new_pid {
+            return false;
+        }
+        let Some(record) = processes.get(current) else {
+            return false;
+        };
+        if record.ppid >= current {
+            return false;
+        }
+        current = record.ppid;
+    }
+    true
 }
 
 fn restore_fds(interp: &mut Interp, saved: crate::descriptors::FdTable) {
@@ -638,7 +815,7 @@ impl ShellContinuation {
         }
     }
 
-    fn abort(&mut self, interp: &mut Interp) {
+    pub(crate) fn abort(&mut self, interp: &mut Interp) {
         for frame in std::mem::take(&mut self.frames).into_iter().rev() {
             match frame {
                 ShellFrame::RestoreRedirect(scope) => end_redirects(interp, scope),
@@ -2949,7 +3126,7 @@ pub(crate) fn poll_machine(
                 interp.processes.mark_signal_termination(owner_pid, signal);
                 let status = 128 + signal.number();
                 if let Some(mut program) = interp.process.program.take() {
-                    program.release_owned_memory(interp);
+                    program.terminate(interp);
                 }
                 interp.invocations.finish_process(
                     owner_pid,
@@ -3763,6 +3940,10 @@ fn glob_to_regex_body(pat: &str) -> String {
     }
     re
 }
+
+#[cfg(test)]
+#[path = "exec/interruption_tests.rs"]
+mod interruption_tests;
 
 #[cfg(test)]
 mod array_tests {

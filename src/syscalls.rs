@@ -80,6 +80,8 @@ pub(crate) enum SignalTarget {
 /// to the same operations; neither path receives host capabilities or the owning `Environment`.
 /// The borrowed handle cannot outlive the quantum, so blocked programs retain only owned state.
 pub(crate) trait System {
+    /// Observe host cancellation separately from permanent resource exhaustion.
+    fn interrupted(&self) -> bool;
     fn pid(&self) -> crate::process::ProcessId;
     fn parent_pid(&self) -> crate::process::ProcessId;
     fn environment(&self) -> std::collections::BTreeMap<String, String>;
@@ -272,6 +274,8 @@ pub(crate) trait System {
     ) -> Result<(), DisplayError>;
     fn input_poll_key(&mut self, handle: u32) -> Result<Option<KeyEvent>, DisplayError>;
     fn display_close(&mut self, handle: u32) -> Result<(), DisplayError>;
+    /// Stop native work at a metered boundary on cancellation or CPU exhaustion.
+    /// Cancellation leaves the resource meter usable; cleanup charges it directly.
     fn charge_cpu(&mut self, units: u64) -> bool;
     fn reserve_memory(&mut self, bytes: u64) -> bool;
     fn release_memory(&mut self, bytes: u64);
@@ -295,6 +299,10 @@ impl<'a> ActiveSystem<'a> {
 }
 
 impl System for ActiveSystem<'_> {
+    fn interrupted(&self) -> bool {
+        self.interp.interrupted()
+    }
+
     fn pid(&self) -> crate::process::ProcessId {
         self.interp.process.pid
     }
@@ -1049,7 +1057,7 @@ impl System for ActiveSystem<'_> {
     }
 
     fn charge_cpu(&mut self, units: u64) -> bool {
-        self.interp.resources.charge_cpu(units)
+        !self.interrupted() && self.interp.resources.charge_cpu(units)
     }
 
     fn reserve_memory(&mut self, bytes: u64) -> bool {
@@ -1069,10 +1077,10 @@ impl System for ActiveSystem<'_> {
     }
 
     fn stop_status(&self) -> i32 {
-        self.interp
-            .resources
-            .stop_reason()
-            .map_or(137, |reason| reason.exit_status())
+        self.interp.resources.stop_reason().map_or_else(
+            || if self.interrupted() { 130 } else { 137 },
+            |reason| reason.exit_status(),
+        )
     }
 
     fn note_unsupported(&mut self, feature: &str) {

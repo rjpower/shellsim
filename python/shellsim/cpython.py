@@ -19,12 +19,12 @@ import subprocess
 import tempfile
 import zipfile
 from pathlib import Path, PurePosixPath
-from typing import TYPE_CHECKING, Sequence, Union
+from typing import TYPE_CHECKING, Optional, Sequence, Union
 
 from .pypi import _REQUIREMENT, PackageInstallError, _compatibility_blockers, _mount_package_tree
 
 if TYPE_CHECKING:
-    from ._api import Environment, RunResult
+    from ._api import CancellationToken, Environment, RunResult
     from ._pypi_catalog import Catalog
 
 _EXECUTABLE = "/usr/bin/python3.wasm"
@@ -205,7 +205,14 @@ class CPythonRuntime:
         environment._native.mount_cpython(str(self.bundle / "rootfs"), self.venv)
         environment._cpython_runtime = self
 
-    def run(self, environment: Environment, argv: Sequence[str], *, stdin: bytes = b"") -> RunResult:
+    def run(
+        self,
+        environment: Environment,
+        argv: Sequence[str],
+        *,
+        stdin: bytes = b"",
+        cancellation: Optional[CancellationToken] = None,
+    ) -> RunResult:
         """Run interpreter arguments such as ``('-c', 'print(42)')`` in the VFS."""
         if isinstance(argv, (str, bytes)) or any(not isinstance(arg, str) for arg in argv):
             raise TypeError("argv must be a sequence of str")
@@ -214,7 +221,7 @@ class CPythonRuntime:
         prefix = "PYTHONDONTWRITEBYTECODE=1 "
         if self.venv is None:
             prefix += "PYTHONHOME=/usr "
-        return environment.run(prefix + command, stdin)
+        return environment.run(prefix + command, stdin, cancellation=cancellation)
 
     def _stage(self, environment: Environment, target: Path) -> None:
         """Reject file conflicts before atomic import; the environment must be idle."""

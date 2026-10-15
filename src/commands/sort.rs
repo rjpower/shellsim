@@ -10,6 +10,7 @@ use super::util::{ewln, read_inputs_system, uses_standard_input};
 use super::{reg_system_poll_costed, CommandSpec, Io, Trust};
 use crate::exec::ShellPoll;
 use crate::program::ProcessContext;
+use crate::syscalls::System;
 
 pub fn register(m: &mut HashMap<&'static str, CommandSpec>) {
     reg_system_poll_costed(m, "/usr/bin/sort", Trust::Real, 100, 16 * 1024, run);
@@ -118,7 +119,7 @@ fn run(context: &mut ProcessContext<'_>, io: &mut Io) -> ShellPoll {
         .saturating_add(1) as u64;
     let scratch = (data.len() as u64)
         .saturating_mul(3)
-        .saturating_add(line_count.saturating_mul(24));
+        .saturating_add(line_count.saturating_mul(48));
     let comparisons = line_count.saturating_mul(line_count.max(1).ilog2() as u64);
     if !context.system.reserve_memory(scratch) {
         return ShellPoll::Ready(context.system.stop_status());
@@ -180,7 +181,10 @@ fn run(context: &mut ProcessContext<'_>, io: &mut Io) -> ShellPoll {
             ordering
         }
     };
-    lines.sort_by(|a, b| compare(a, b));
+    if !sort_lines(&mut lines, &compare, context.system) {
+        context.system.release_memory(scratch);
+        return ShellPoll::Ready(130);
+    }
     if reverse {
         lines.reverse();
     }
@@ -203,6 +207,54 @@ fn run(context: &mut ProcessContext<'_>, io: &mut Io) -> ShellPoll {
     };
     context.system.release_memory(scratch);
     ShellPoll::Ready(status)
+}
+
+/// Bound work between cancellation checks: the standard sort API cannot return early.
+/// Interrupted records are discarded; only a completed sort reaches the command's output.
+fn sort_lines(
+    lines: &mut Vec<Vec<u8>>,
+    compare: &impl Fn(&[u8], &[u8]) -> std::cmp::Ordering,
+    system: &mut dyn System,
+) -> bool {
+    const CHUNK: usize = 256;
+    for chunk in lines.chunks_mut(CHUNK) {
+        if system.interrupted() {
+            return false;
+        }
+        chunk.sort_by(|a, b| compare(a, b));
+    }
+    if lines.len() <= CHUNK {
+        return !system.interrupted();
+    }
+    let mut scratch = vec![Vec::new(); lines.len()];
+    let mut width = CHUNK;
+    while width < lines.len() {
+        for start in (0..lines.len()).step_by(width.saturating_mul(2)) {
+            let middle = start.saturating_add(width).min(lines.len());
+            let end = middle.saturating_add(width).min(lines.len());
+            let (mut left, mut right) = (start, middle);
+            for (output, slot) in scratch.iter_mut().enumerate().take(end).skip(start) {
+                if output % CHUNK == 0 && system.interrupted() {
+                    return false;
+                }
+                let index = if left < middle
+                    && (right == end || !compare(&lines[left], &lines[right]).is_gt())
+                {
+                    let index = left;
+                    left += 1;
+                    index
+                } else {
+                    let index = right;
+                    right += 1;
+                    index
+                };
+                *slot = std::mem::take(&mut lines[index]);
+            }
+        }
+        std::mem::swap(lines, &mut scratch);
+        width = width.saturating_mul(2);
+    }
+    !system.interrupted()
 }
 
 #[derive(Clone, Copy)]

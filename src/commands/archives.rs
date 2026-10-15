@@ -1,7 +1,7 @@
-//! Bounded archive and compression commands over simulated files and descriptors.
+//! Resource-metered archive and compression commands over simulated files and descriptors.
 //!
-//! The first slice models deterministic gzip streams. Decompression is capped before host-side
-//! materialization, all named inputs and outputs stay in the VFS, and unsupported command-line
+//! Gzip streams are deterministic. Decompression charges the environment's CPU and memory budgets
+//! incrementally, all named inputs and outputs stay in the VFS, and unsupported command-line
 //! forms fail explicitly instead of reaching a host utility.
 
 use std::collections::HashMap;
@@ -15,8 +15,6 @@ use crate::commands::{CommandSpec, Io, Trust};
 use crate::exec::ShellPoll;
 use crate::program::ProcessContext;
 use crate::syscalls::{FileKind, System};
-
-const MAX_DECOMPRESSED_BYTES: usize = 16 * 1024 * 1024;
 
 pub fn register(commands: &mut HashMap<&'static str, CommandSpec>) {
     super::reg_system_poll(commands, "/usr/bin/gzip", Trust::Partial, cmd_gzip);
@@ -205,26 +203,47 @@ fn transform(
                 .mtime(0)
                 .write(Vec::with_capacity(bound), Compression::new(level));
             let mut encoder = encoder;
-            encoder
-                .write_all(input)
-                .map_err(|error| error.to_string())?;
+            for chunk in input.chunks(16 * 1024) {
+                if system.interrupted() {
+                    return Err("compression interrupted".to_string());
+                }
+                encoder
+                    .write_all(chunk)
+                    .map_err(|error| error.to_string())?;
+            }
             encoder.finish().map_err(|error| error.to_string())
         }
         Operation::Decompress => {
-            if !system.reserve_memory(MAX_DECOMPRESSED_BYTES as u64) {
-                return Err("memory limit exceeded".to_string());
-            }
-            let decoder = MultiGzDecoder::new(input);
+            let mut decoder = MultiGzDecoder::new(input);
             let mut output = Vec::new();
-            decoder
-                .take((MAX_DECOMPRESSED_BYTES + 1) as u64)
-                .read_to_end(&mut output)
-                .map_err(|error| error.to_string())?;
-            if output.len() > MAX_DECOMPRESSED_BYTES {
-                return Err("decompressed output exceeds the 16 MiB limit".to_string());
-            }
-            if !system.charge_cpu(u64::try_from(output.len()).unwrap_or(u64::MAX)) {
-                return Err("resource limit exceeded".to_string());
+            let mut buffer = [0; 16 * 1024];
+            loop {
+                if system.interrupted() {
+                    return Err("decompression interrupted".to_string());
+                }
+                let count = decoder
+                    .read(&mut buffer)
+                    .map_err(|error| error.to_string())?;
+                if count == 0 {
+                    break;
+                }
+                if !system.charge_cpu(count as u64) {
+                    return Err("resource limit exceeded".to_string());
+                }
+                let required = output
+                    .len()
+                    .checked_add(count)
+                    .ok_or_else(|| "decompressed output is too large".to_string())?;
+                if required > output.capacity() {
+                    let capacity = required.max(output.capacity().saturating_mul(2));
+                    if !system.reserve_memory(
+                        u64::try_from(capacity - output.capacity()).unwrap_or(u64::MAX),
+                    ) {
+                        return Err("memory limit exceeded".to_string());
+                    }
+                    output.reserve_exact(capacity - output.len());
+                }
+                output.extend_from_slice(&buffer[..count]);
             }
             Ok(output)
         }
@@ -236,7 +255,7 @@ pub(super) fn gzip_bytes(system: &mut dyn System, input: &[u8]) -> Result<Vec<u8
     transform(system, Operation::Compress, 6, input)
 }
 
-/// Decompress a bounded gzip byte stream for another modeled archive command.
+/// Decompress a gzip byte stream within the environment's resource budgets.
 pub(super) fn gunzip_bytes(system: &mut dyn System, input: &[u8]) -> Result<Vec<u8>, String> {
     transform(system, Operation::Decompress, 6, input)
 }

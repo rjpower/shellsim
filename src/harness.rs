@@ -11,6 +11,7 @@ use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 
+use crate::exec::process_belongs_to_action;
 use crate::net::{HttpResponse, NetworkRequest, MAX_HOST_MESSAGE_BYTES};
 use crate::process::{ProcessRecord, ProcessStatus};
 use crate::scheduler::{TaskState, WaitReason};
@@ -23,7 +24,6 @@ const MAX_WORKSPACE_CLONE_BYTES: u64 = 6 * 1024 * 1024;
 const MAX_SESSION_FORK_BYTES: u64 = 96 * 1024 * 1024;
 const MAX_RETAINED_ACTIONS: usize = 64;
 const MAX_POLL_QUANTA: usize = 100_000;
-const MAX_CANCEL_QUANTA: usize = 100_000;
 const MAX_PACKAGE_SNAPSHOT_BYTES: usize = 128 * 1024 * 1024;
 const MAX_PACKAGE_SNAPSHOT_ENTRIES: usize = crate::host_ingest::MAX_HOST_FILES;
 
@@ -1189,12 +1189,7 @@ impl HarnessSession {
             self.actions.insert(action_id, action);
             return Err(format!("action {action_id} is complete"));
         };
-        let result = cancel_execution(
-            &mut self.environment,
-            &mut execution,
-            action_id,
-            action.root_pid,
-        );
+        let result = execution.cancel(&mut self.environment, 137);
         let result = match result {
             Ok(status) => {
                 execution.drain_output(
@@ -1208,6 +1203,11 @@ impl HarnessSession {
                 }
                 self.environment.last_status = status;
                 action.complete(&self.environment, status);
+                action
+                    .outcome
+                    .as_mut()
+                    .expect("completed action")
+                    .interrupted = true;
                 self.active_action = None;
                 self.environment.net.discard_host_requests();
                 Ok(action.view(&self.environment))
@@ -1394,69 +1394,6 @@ impl HarnessSession {
             }
         }
     }
-}
-
-/// Check ancestry as well as PID age so an old background job cannot delegate a new child.
-fn process_belongs_to_action(
-    processes: &crate::process::ProcessTable,
-    pid: u32,
-    root_pid: u32,
-    first_new_pid: u32,
-) -> bool {
-    let mut current = pid;
-    while current != root_pid {
-        if current < first_new_pid {
-            return false;
-        }
-        let Some(record) = processes.get(current) else {
-            return false;
-        };
-        if record.ppid >= current {
-            return false;
-        }
-        current = record.ppid;
-    }
-    true
-}
-
-fn cancel_execution(
-    environment: &mut Environment,
-    execution: &mut crate::exec::ShellExecution,
-    action_id: u64,
-    root_pid: u32,
-) -> Result<i32, String> {
-    let process_group = environment
-        .processes
-        .get(root_pid)
-        .map(|record| record.process_group)
-        .ok_or_else(|| format!("action {action_id} root process does not exist"))?;
-    let _ = execution.close_stdin(environment);
-    for pid in environment.processes.live_group(process_group) {
-        if pid != root_pid {
-            environment.send_signal(pid, crate::process::Signal::Kill)?;
-        }
-    }
-
-    let mut root_signaled = false;
-    for _ in 0..MAX_CANCEL_QUANTA {
-        let live_group = environment.processes.live_group(process_group);
-        if !root_signaled && live_group.iter().all(|pid| *pid == root_pid) {
-            environment.send_signal(root_pid, crate::process::Signal::Kill)?;
-            root_signaled = true;
-        }
-        match execution.poll(environment, false)? {
-            crate::exec::MachinePoll::Progress => {}
-            crate::exec::MachinePoll::Blocked => {
-                return Err(format!(
-                    "action {action_id} cancellation blocked without a modeled event"
-                ));
-            }
-            crate::exec::MachinePoll::Ready(status) => return Ok(status),
-        }
-    }
-    Err(format!(
-        "action {action_id} cancellation exceeded its work bound"
-    ))
 }
 
 fn process_view(record: &ProcessRecord, task_state: Option<TaskState>) -> ProcessView {
@@ -1899,6 +1836,7 @@ mod tests {
         for machine in [&mut session, &mut branch] {
             let complete = machine.poll_action(action_id, 100, true).unwrap();
             assert_eq!(complete.state, ActionState::Complete { status: 0 });
+            assert!(!complete.outcome.as_ref().unwrap().interrupted);
             assert_eq!(machine.environment.clock.monotonic_ns(), 2_000_000_000);
             let final_output = machine.read_action_output(action_id).unwrap();
             assert_eq!(STANDARD.decode(final_output.stdout_base64).unwrap(), b"two");

@@ -117,6 +117,9 @@ impl ShellExpansionError {
 /// Machine-wide state and limits shared by cooperatively scheduled logical processes.
 #[derive(Clone)]
 pub struct Environment {
+    /// Host-only request for the current action, shared by its logical descendants.
+    pub(crate) cancellation: crate::interruption::ActionCancellation,
+    pub(crate) next_action_generation: u64,
     pub vfs: Vfs,
     /// Machine hostname, independent of process-local shell variables.
     pub(crate) hostname: String,
@@ -155,6 +158,8 @@ pub struct Environment {
 /// Shell-local state for the single process currently executing in an [`Environment`].
 #[derive(Clone)]
 pub struct ProcessState {
+    /// Host action that started this process. Forked children inherit ownership.
+    pub(crate) action_generation: u64,
     /// PID of the currently executing logical process.
     pub pid: ProcessId,
     /// PID of the logical parent process.
@@ -292,6 +297,13 @@ pub struct ProcessStates {
 }
 
 impl ProcessStates {
+    pub(crate) fn action_members(&self, generation: u64) -> Vec<ProcessId> {
+        self.states
+            .values()
+            .filter(|state| state.action_generation == generation)
+            .map(|state| state.pid)
+            .collect()
+    }
     fn new(root: ProcessState) -> Self {
         let active = root.pid;
         Self {
@@ -409,6 +421,7 @@ impl ProcessState {
         Self {
             pid: identity.pid,
             ppid: self.pid,
+            action_generation: self.action_generation,
             process_group: identity.process_group,
             session_id: identity.session_id,
             shell_pid: if new_shell {
@@ -790,6 +803,8 @@ impl Environment {
         let mut processes = ProcessTable::new(ROOT_PID, "/".to_string(), process_environment);
         processes.update_descriptors(ROOT_PID, descriptor_snapshot);
         let mut environment = Environment {
+            cancellation: crate::interruption::ActionCancellation::default(),
+            next_action_generation: 1,
             vfs,
             hostname: "sandbox".to_string(),
             clock,
@@ -803,6 +818,7 @@ impl Environment {
             descriptors,
             pipe_reservations: BTreeMap::new(),
             process: ProcessStates::new(ProcessState {
+                action_generation: 0,
                 pid: ROOT_PID,
                 ppid: 0,
                 process_group: ROOT_PID,
@@ -2505,6 +2521,11 @@ impl Environment {
         let mut pending = vec![start];
         let mut paths = Vec::new();
         while let Some(current) = pending.pop() {
+            if self.interrupted() {
+                return Err(crate::vfs::VfsError::Invalid(
+                    "interrupted traversal".to_string(),
+                ));
+            }
             let node = self.fs_metadata("/", &current, false)?;
             let is_dir = matches!(node.kind, crate::vfs::NodeKind::Dir);
             paths.push(current.clone());
@@ -2803,6 +2824,63 @@ impl Environment {
     pub fn outcome(&self, exit_status: i32) -> RunOutcome {
         self.resources
             .outcome(exit_status, self.vfs.disk_used(), self.vfs.disk_peak())
+    }
+
+    /// Whether the host requested interruption of the current action.
+    ///
+    /// Native work must check this between bounded chunks. Resource accounting and cleanup
+    /// remain independent, so an interrupted action does not poison subsequent runs.
+    /// A positive check records that this action observed the request before completion.
+    pub fn interrupted(&self) -> bool {
+        #[cfg(test)]
+        if let Some(token) = &self.cancellation.token {
+            token.native_checkpoint();
+        }
+        let requested = self.cancellation_requested()
+            && self
+                .cancellation
+                .generation
+                .is_none_or(|generation| self.process.action_generation == generation);
+        if requested {
+            self.cancellation.interrupted.set(true);
+        }
+        requested
+    }
+
+    pub(crate) fn cancellation_requested(&self) -> bool {
+        self.cancellation
+            .token
+            .as_ref()
+            .is_some_and(crate::CancellationToken::is_cancelled)
+    }
+
+    /// Bind one cancellation request while executing a host action on this machine.
+    ///
+    /// Use a new token for every action. Requests may arrive before execution or from another
+    /// host thread. They are observed cooperatively, never by forcibly unwinding a host thread.
+    pub fn with_cancellation<T>(
+        &mut self,
+        token: &crate::CancellationToken,
+        action: impl FnOnce(&mut Self) -> T,
+    ) -> Result<T, String> {
+        token.bind()?;
+        let previous = std::mem::replace(
+            &mut self.cancellation,
+            crate::interruption::ActionCancellation {
+                token: Some(token.clone()),
+                interrupted: Cell::new(false),
+                generation: None,
+            },
+        );
+        // The Python adapter catches worker panics without poisoning its outer environment
+        // mutex. Restore the binding before propagating a panic to that existing boundary.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| action(self)));
+        self.cancellation = previous;
+        token.finish();
+        match result {
+            Ok(result) => Ok(result),
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
     }
 
     /// Whether this persistent shell can accept another action.
