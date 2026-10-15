@@ -85,7 +85,7 @@ fn run(context: &mut ProcessContext<'_>, io: &mut Io) -> ShellPoll {
 
     if !context
         .system
-        .checkpoint_cpu((source.len() as u64).saturating_add(1))
+        .charge_cpu((source.len() as u64).saturating_add(1))
     {
         return ShellPoll::Ready(context.system.stop_status());
     }
@@ -1040,7 +1040,7 @@ struct Ctx<'a> {
 
 impl Ctx<'_> {
     fn charge(&mut self, units: u64) -> Result<(), Abort> {
-        if self.system.checkpoint_cpu(units.max(1)) {
+        if self.system.charge_cpu(units.max(1)) {
             Ok(())
         } else {
             Err(Abort::Resource)

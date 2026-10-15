@@ -105,7 +105,7 @@ fn run(context: &mut ProcessContext<'_>, io: &mut Io) -> ShellPoll {
         sources.push(source);
     }
     let source = sources.join("\n");
-    if !context.system.checkpoint_cpu(source.len() as u64) {
+    if !context.system.charge_cpu(source.len() as u64) {
         return ShellPoll::Ready(context.system.stop_status());
     }
     let program = match parser::parse(&source).and_then(|program| {
@@ -198,7 +198,7 @@ fn run(context: &mut ProcessContext<'_>, io: &mut Io) -> ShellPoll {
     if !context.system.reserve_memory(scratch) {
         return ShellPoll::Ready(context.system.stop_status());
     }
-    if !context.system.checkpoint_cpu(input_bytes) {
+    if !context.system.charge_cpu(input_bytes) {
         context.system.release_memory(scratch);
         return ShellPoll::Ready(context.system.stop_status());
     }

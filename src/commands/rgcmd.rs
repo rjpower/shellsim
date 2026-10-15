@@ -104,7 +104,7 @@ fn search_inputs(
         .unwrap_or(inputs.len() > 1 || inputs.iter().any(|input| input.recursive));
     let mut any = false;
     for input in inputs {
-        if !system.checkpoint_cpu(1) {
+        if !system.charge_cpu(1) {
             return system.stop_status();
         }
         if options.list_files {
@@ -142,7 +142,7 @@ fn search_inputs(
             if options.max_count == Some(0) {
                 break;
             }
-            if !system.checkpoint_cpu(1_u64.saturating_add(line.len() as u64)) {
+            if !system.charge_cpu(1_u64.saturating_add(line.len() as u64)) {
                 return system.stop_status();
             }
             if !(matcher.is_match(line) ^ options.invert) {
@@ -222,7 +222,7 @@ fn search_with_context(
     let mut matches = Vec::with_capacity(line_count);
     let mut matched_count = 0_usize;
     for line in &lines {
-        if !system.checkpoint_cpu(1_u64.saturating_add(line.len() as u64)) {
+        if !system.charge_cpu(1_u64.saturating_add(line.len() as u64)) {
             system.release_memory(reserved);
             return None;
         }

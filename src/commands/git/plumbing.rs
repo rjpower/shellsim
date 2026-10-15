@@ -611,7 +611,7 @@ pub(crate) fn git_grep(system: &mut dyn System, args: &[String], io: &mut Io) ->
         let Some(data) = data else {
             continue;
         };
-        if !system.checkpoint_cpu(data.len() as u64) {
+        if !system.charge_cpu(data.len() as u64) {
             return repo::resource_error(system);
         }
         if super::diff::is_binary(&data) {
@@ -920,7 +920,7 @@ pub(crate) fn git_blame(system: &mut dyn System, args: &[String], io: &mut Io) -
         .into_iter()
         .map(|line| line.trim_end_matches('\n').to_string())
         .collect();
-    if !system.checkpoint_cpu((lines.len() as u64).saturating_mul(64)) {
+    if !system.charge_cpu((lines.len() as u64).saturating_mul(64)) {
         return repo::resource_error(system);
     }
     let stored = pending.map(|_| tip[&path].hash.clone());
@@ -1039,7 +1039,7 @@ fn trace_lines(
             }
             break;
         };
-        if !system.checkpoint_cpu((current_content.len() + parent_content.len()) as u64) {
+        if !system.charge_cpu((current_content.len() + parent_content.len()) as u64) {
             return None;
         }
         let carried = carry_lines(

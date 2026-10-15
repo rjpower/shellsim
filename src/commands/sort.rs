@@ -126,7 +126,7 @@ fn run(context: &mut ProcessContext<'_>, io: &mut Io) -> ShellPoll {
     }
     if !context
         .system
-        .checkpoint_cpu((data.len() as u64).saturating_add(comparisons))
+        .charge_cpu((data.len() as u64).saturating_add(comparisons))
     {
         context.system.release_memory(scratch);
         return ShellPoll::Ready(context.system.stop_status());
@@ -209,8 +209,8 @@ fn run(context: &mut ProcessContext<'_>, io: &mut Io) -> ShellPoll {
     ShellPoll::Ready(status)
 }
 
-/// Stable merges keep comparator calls inside bounded chunks, so cancellation never changes
-/// a comparator's ordering midway through Rust's opaque sort implementation.
+/// Bound work between cancellation checks: the standard sort API cannot return early.
+/// Interrupted records are discarded; only a completed sort reaches the command's output.
 fn sort_lines(
     lines: &mut Vec<Vec<u8>>,
     compare: &impl Fn(&[u8], &[u8]) -> std::cmp::Ordering,

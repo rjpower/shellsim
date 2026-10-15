@@ -49,7 +49,7 @@ fn read_named(system: &mut dyn System, path: &str) -> Result<Vec<u8>, SyscallErr
 /// Charge for byte-oriented work that the old command dispatcher metered after execution.
 fn charge_input(system: &mut dyn System, length: usize) -> Result<(), ShellPoll> {
     let units = u64::try_from(length).unwrap_or(u64::MAX);
-    if system.checkpoint_cpu(units) {
+    if system.charge_cpu(units) {
         Ok(())
     } else {
         Err(ShellPoll::Ready(system.stop_status()))

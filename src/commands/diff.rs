@@ -170,7 +170,7 @@ fn diff_files(
         ewln(io.err, "diff: inputs are too large for line comparison");
         return 2;
     }
-    if !system.checkpoint_cpu(u64::try_from(cells).unwrap_or(u64::MAX)) {
+    if !system.charge_cpu(u64::try_from(cells).unwrap_or(u64::MAX)) {
         return system.stop_status();
     }
     let matrix_memory = u64::try_from(cells)

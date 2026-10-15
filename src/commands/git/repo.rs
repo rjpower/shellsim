@@ -1156,7 +1156,7 @@ pub(crate) fn collect_working_tree(system: &mut dyn System, root: &str) -> Resul
     if !system.reserve_memory(reserved_memory) {
         return Err(resource_error(system));
     }
-    if !system.checkpoint_cpu(path_bytes.saturating_add(content_bytes)) {
+    if !system.charge_cpu(path_bytes.saturating_add(content_bytes)) {
         system.release_memory(reserved_memory);
         return Err(resource_error(system));
     }
@@ -1190,7 +1190,7 @@ pub(crate) fn metered_file_hash(
     if let Ok(info) = system.metadata("/", path, false) {
         if info.kind == FileKind::Symlink {
             let target = info.link_target.unwrap_or_default();
-            if !system.checkpoint_cpu(target.len() as u64) {
+            if !system.charge_cpu(target.len() as u64) {
                 return Err(resource_error(system));
             }
             return Ok(Some(blob_hash(target.as_bytes())));
@@ -1206,7 +1206,7 @@ pub(crate) fn metered_file_hash(
     if !system.reserve_memory(length) {
         return Err(resource_error(system));
     }
-    if !system.checkpoint_cpu(length) {
+    if !system.charge_cpu(length) {
         system.release_memory(length);
         return Err(resource_error(system));
     }

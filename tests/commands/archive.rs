@@ -4,12 +4,16 @@ use std::io::Write;
 use std::process::{Command, Output, Stdio};
 
 use flate2::write::DeflateEncoder;
+use flate2::write::GzEncoder;
 use flate2::Compression;
 use shellsim::{Environment, Limits, StopReason};
 
 #[test]
 fn gzip_round_trips_named_files_and_standard_streams() {
-    let mut environment = Environment::new();
+    let mut environment = Environment::with_limits(Limits {
+        memory: 256 * 1024,
+        ..Limits::default()
+    });
     environment
         .vfs
         .write("/", "/work/input.txt", b"alpha\nbeta\n", 0o644)
@@ -36,6 +40,51 @@ fn gzip_round_trips_named_files_and_standard_streams() {
         String::from_utf8_lossy(&stderr)
     );
     assert_eq!(stdout, b"streamed");
+}
+
+#[test]
+fn gunzip_uses_environment_budgets_instead_of_a_fixed_output_cap() {
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
+    let chunk = [b'x'; 16 * 1024];
+    let length = 17 * 1024 * 1024;
+    for _ in 0..length / chunk.len() {
+        encoder.write_all(&chunk).unwrap();
+    }
+    let compressed = encoder.finish().unwrap();
+    for (limits, stop_reason) in [
+        (Limits::default(), None),
+        (
+            Limits {
+                memory: 256 * 1024,
+                ..Limits::default()
+            },
+            Some(StopReason::MemoryExhausted),
+        ),
+        (
+            Limits {
+                cpu: 128 * 1024,
+                ..Limits::default()
+            },
+            Some(StopReason::CpuExhausted),
+        ),
+    ] {
+        let mut environment = Environment::with_limits(limits);
+        environment
+            .vfs
+            .write("/", "/work/payload.gz", &compressed, 0o644)
+            .unwrap();
+        let (outcome, _, stderr) = environment.run_script_capture("gunzip /work/payload.gz");
+        assert_eq!(outcome.stop_reason, stop_reason, "{limits:?}: {stderr:?}");
+        if stop_reason.is_some() {
+            assert!(!environment.vfs.exists("/", "/work/payload"));
+            assert!(environment.vfs.exists("/", "/work/payload.gz"));
+        } else {
+            assert_eq!(outcome.exit_status, 0, "{stderr:?}");
+            let output = environment.vfs.read("/", "/work/payload").unwrap();
+            assert_eq!(output.len(), length);
+            assert!(output.iter().all(|byte| *byte == b'x'));
+        }
+    }
 }
 
 #[test]

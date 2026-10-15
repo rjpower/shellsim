@@ -48,7 +48,7 @@ fn run(context: &mut ProcessContext<'_>, io: &mut Io) -> i32 {
     };
     // Bound parse/regex work by the size of the argv actually supplied.
     let cost: u64 = args.iter().map(|a| a.len() as u64 + 1).sum();
-    if !context.system.checkpoint_cpu(cost.max(1)) {
+    if !context.system.charge_cpu(cost.max(1)) {
         return context.system.stop_status();
     }
     if args.is_empty() {
@@ -180,7 +180,7 @@ struct SystemMeter<'a>(&'a mut dyn System);
 
 impl CpuMeter for SystemMeter<'_> {
     fn charge(&mut self, units: u64) -> Result<(), EvalError> {
-        if self.0.checkpoint_cpu(units.max(1)) {
+        if self.0.charge_cpu(units.max(1)) {
             Ok(())
         } else {
             Err(EvalError::Resource(self.0.stop_status()))

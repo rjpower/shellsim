@@ -179,8 +179,7 @@ pub(crate) fn recipe_prefixes(recipe: &str) -> (bool, bool, &str) {
 
 pub(crate) fn parse_makefile(system: &mut impl System, source: &str) -> Result<Makefile, String> {
     let bytes = source.len();
-    if !system.checkpoint_cpu(bytes as u64)
-        || !system.reserve_memory((bytes as u64).saturating_mul(2))
+    if !system.charge_cpu(bytes as u64) || !system.reserve_memory((bytes as u64).saturating_mul(2))
     {
         return Err("resource limit exceeded while reading makefile".to_string());
     }

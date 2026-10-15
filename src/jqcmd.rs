@@ -121,7 +121,7 @@ fn jq_inner(system: &mut dyn System, args: &[String], stdin: Vec<u8>, out: Out, 
 
     let mut operands = parsed.operands.into_iter();
     let filter = operands.next().unwrap_or_else(|| ".".to_string());
-    if !system.checkpoint_cpu(filter.len() as u64) {
+    if !system.charge_cpu(filter.len() as u64) {
         return system.stop_status();
     }
     let expression = match Parser::parse(&filter) {
@@ -258,7 +258,7 @@ fn emit(system: &mut dyn System, value: &Value, raw: bool, indent: usize, out: O
     let bound = render_bound(value, indent as u64, 0).saturating_add(1);
     if bound > system.output_remaining()
         || !system.reserve_memory(bound)
-        || !system.checkpoint_cpu(bound)
+        || !system.charge_cpu(bound)
     {
         if bound > system.output_remaining() {
             let request = system.output_remaining().saturating_add(1);
@@ -910,7 +910,7 @@ struct Evaluator<'a> {
 impl Evaluator<'_> {
     fn push(&mut self, output: &mut Vec<Value>, value: Value) -> Result<(), EvalError> {
         let bytes = render_bound(&value, 0, 0).saturating_add(32);
-        if !self.system.checkpoint_cpu(1) || !self.system.reserve_memory(bytes) {
+        if !self.system.charge_cpu(1) || !self.system.reserve_memory(bytes) {
             return Err(EvalError::Exhausted);
         }
         output.push(value);
@@ -943,7 +943,7 @@ impl Evaluator<'_> {
     }
 
     fn eval_inner(&mut self, expression: &Expr, input: &Value) -> Result<Vec<Value>, EvalError> {
-        if !self.system.checkpoint_cpu(1) {
+        if !self.system.charge_cpu(1) {
             return Err(EvalError::Exhausted);
         }
         match expression {
@@ -1083,7 +1083,7 @@ impl Evaluator<'_> {
                     object.insert(name.clone(), value.clone());
                     let value = Value::Object(object);
                     let bytes = render_bound(&value, 0, 0).saturating_add(32);
-                    if !self.system.checkpoint_cpu(1) || !self.system.reserve_memory(bytes) {
+                    if !self.system.charge_cpu(1) || !self.system.reserve_memory(bytes) {
                         return Err(EvalError::Exhausted);
                     }
                     let Value::Object(object) = value else {

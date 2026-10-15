@@ -214,3 +214,33 @@ fn native_interpreter_loops_stop_at_interior_checkpoints_and_leave_cpu_available
         assert_eq!(stdout, b"usable");
     }
 }
+
+#[test]
+fn interruption_during_sort_discards_output_and_leaves_the_machine_usable() {
+    let mut environment = Environment::new();
+    let input = (0..4096)
+        .rev()
+        .map(|number| format!("{number:04}\n"))
+        .collect::<String>();
+    environment
+        .vfs
+        .write("/", "/input", input.as_bytes(), 0o644)
+        .unwrap();
+    environment
+        .vfs
+        .write("/", "/result", b"original", 0o644)
+        .unwrap();
+    let token = CancellationToken::after_native_checks(64);
+    let (outcome, stdout, stderr) = environment
+        .with_cancellation(&token, |environment| {
+            environment.run_script_capture("sort -o /result /input")
+        })
+        .unwrap();
+    assert!(outcome.interrupted, "{stderr:?}");
+    assert!(outcome.stop_reason.is_none());
+    assert!(stdout.is_empty());
+    assert_eq!(environment.vfs.read("/", "/result").unwrap(), b"original");
+    let (outcome, stdout, _) = environment.run_script_capture("printf usable");
+    assert_eq!(outcome.exit_status, 0);
+    assert_eq!(stdout, b"usable");
+}

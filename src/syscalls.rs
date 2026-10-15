@@ -82,11 +82,6 @@ pub(crate) enum SignalTarget {
 pub(crate) trait System {
     /// Observe host cancellation separately from permanent resource exhaustion.
     fn interrupted(&self) -> bool;
-    /// Native work checks cancellation at its existing CPU-metered operation boundaries.
-    /// Cleanup uses the resource meter directly and does not call this helper.
-    fn checkpoint_cpu(&mut self, units: u64) -> bool {
-        !self.interrupted() && self.charge_cpu(units)
-    }
     fn pid(&self) -> crate::process::ProcessId;
     fn parent_pid(&self) -> crate::process::ProcessId;
     fn environment(&self) -> std::collections::BTreeMap<String, String>;
@@ -279,6 +274,8 @@ pub(crate) trait System {
     ) -> Result<(), DisplayError>;
     fn input_poll_key(&mut self, handle: u32) -> Result<Option<KeyEvent>, DisplayError>;
     fn display_close(&mut self, handle: u32) -> Result<(), DisplayError>;
+    /// Stop native work at a metered boundary on cancellation or CPU exhaustion.
+    /// Cancellation leaves the resource meter usable; cleanup charges it directly.
     fn charge_cpu(&mut self, units: u64) -> bool;
     fn reserve_memory(&mut self, bytes: u64) -> bool;
     fn release_memory(&mut self, bytes: u64);
@@ -1060,7 +1057,7 @@ impl System for ActiveSystem<'_> {
     }
 
     fn charge_cpu(&mut self, units: u64) -> bool {
-        self.interp.resources.charge_cpu(units)
+        !self.interrupted() && self.interp.resources.charge_cpu(units)
     }
 
     fn reserve_memory(&mut self, bytes: u64) -> bool {
