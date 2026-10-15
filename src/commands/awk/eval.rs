@@ -378,7 +378,7 @@ impl Runtime<'_, '_> {
     }
 
     fn statement_inner(&mut self, statement: &Stmt) -> Flow {
-        if !self.system.charge_cpu(1) {
+        if !self.system.checkpoint_cpu(1) {
             return Flow::Exhausted;
         }
         match statement {
@@ -535,7 +535,7 @@ impl Runtime<'_, '_> {
     }
 
     fn expr_inner(&mut self, expression: &Expr) -> Result<Scalar, Flow> {
-        if !self.system.charge_cpu(1) {
+        if !self.system.checkpoint_cpu(1) {
             return Err(Flow::Exhausted);
         }
         match expression {
@@ -543,7 +543,7 @@ impl Runtime<'_, '_> {
             Expr::Number(value) => Ok(Scalar::number(*value)),
             Expr::Regex(pattern) => {
                 if !self.literal_regexes.contains_key(pattern) {
-                    if !self.system.charge_cpu(pattern.len() as u64) {
+                    if !self.system.checkpoint_cpu(pattern.len() as u64) {
                         return Err(Flow::Exhausted);
                     }
                     let regex = regex::Regex::new(pattern).map_err(|error| {
@@ -716,7 +716,7 @@ impl Runtime<'_, '_> {
         if !self.system.reserve_memory(bytes) {
             return Err(Flow::Exhausted);
         }
-        if !self.system.charge_cpu(bytes) {
+        if !self.system.checkpoint_cpu(bytes) {
             self.system.release_memory(bytes);
             return Err(Flow::Exhausted);
         }
@@ -1033,7 +1033,7 @@ impl Runtime<'_, '_> {
                     if !self.system.reserve_memory(scratch) {
                         return Err(Flow::Exhausted);
                     }
-                    if !self.system.charge_cpu(scratch) {
+                    if !self.system.checkpoint_cpu(scratch) {
                         self.system.release_memory(scratch);
                         return Err(Flow::Exhausted);
                     }

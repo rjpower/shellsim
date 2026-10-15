@@ -805,6 +805,7 @@ mod tests {
     fn classifies_missing_modules_before_generic_mismatches() {
         let outcome = RunOutcome {
             exit_status: 1,
+            interrupted: false,
             stop_reason: None,
             limits: Limits::default(),
             usage: crate::Usage {

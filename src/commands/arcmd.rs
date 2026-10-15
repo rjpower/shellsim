@@ -115,7 +115,7 @@ fn save(system: &mut dyn System, archive: &str, members: &[Member]) -> Result<()
             .checked_add(member.data.len())
             .ok_or("archive size overflow")
     })?;
-    if work > MAX_ARCHIVE_BYTES || !system.charge_cpu(work as u64) {
+    if work > MAX_ARCHIVE_BYTES || !system.checkpoint_cpu(work as u64) {
         return Err("archive resource limit exceeded".into());
     }
     let bytes = encode_archive(members)?;
@@ -131,7 +131,7 @@ fn read_input(system: &mut dyn System, path: &str) -> Result<Vec<u8>, String> {
         .metadata(&cwd, path, true)
         .map(|info| info.size)
         .map_err(|error| error.to_string())?;
-    if size > MAX_ARCHIVE_BYTES as u64 || !system.charge_cpu(size) {
+    if size > MAX_ARCHIVE_BYTES as u64 || !system.checkpoint_cpu(size) {
         return Err("archive resource limit exceeded".into());
     }
     system

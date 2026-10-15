@@ -172,7 +172,7 @@ fn encode(system: &mut dyn System, entries: &[Entry]) -> Result<Vec<u8>, String>
     if !system.reserve_memory(estimated as u64) {
         return Err("memory limit exceeded".to_string());
     }
-    if !system.charge_cpu(estimated as u64) {
+    if !system.checkpoint_cpu(estimated as u64) {
         system.release_memory(estimated as u64);
         return Err("resource limit exceeded".to_string());
     }
@@ -400,7 +400,7 @@ fn decode(system: &mut dyn System, archive: &[u8]) -> Result<Vec<Entry>, String>
     if !system.reserve_memory(total_size as u64) {
         return Err("memory limit exceeded".to_string());
     }
-    if !system.charge_cpu(archive.len() as u64 + total_size as u64) {
+    if !system.checkpoint_cpu(archive.len() as u64 + total_size as u64) {
         system.release_memory(total_size as u64);
         return Err("resource limit exceeded".to_string());
     }

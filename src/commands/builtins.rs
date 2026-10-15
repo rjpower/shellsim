@@ -1688,7 +1688,7 @@ fn eval_test(interp: &mut Interp, a: &[&str], depth: usize) -> Result<bool, Test
         return Err(TestError::TooDeep);
     }
     let a = strip_test_parens(interp, a)?;
-    if !interp.resources.charge_cpu(a.len() as u64) {
+    if interp.interrupted() || !interp.resources.charge_cpu(a.len() as u64) {
         return Err(TestError::Stopped);
     }
     let nested =
@@ -1800,7 +1800,7 @@ fn strip_test_parens<'a>(
     mut args: &'a [&'a str],
 ) -> Result<&'a [&'a str], TestError> {
     while args.first() == Some(&"(") && args.last() == Some(&")") {
-        if !interp.resources.charge_cpu(args.len() as u64) {
+        if interp.interrupted() || !interp.resources.charge_cpu(args.len() as u64) {
             return Err(TestError::Stopped);
         }
         let mut depth = 0_i32;

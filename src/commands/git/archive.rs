@@ -50,7 +50,7 @@ pub(crate) fn git_archive(system: &mut dyn System, args: &[String], io: &mut Io)
         })
         .collect();
     if !system
-        .charge_cpu((tree.len() as u64).saturating_mul((paths.len() as u64).saturating_add(1)))
+        .checkpoint_cpu((tree.len() as u64).saturating_mul((paths.len() as u64).saturating_add(1)))
     {
         return repo::resource_error(system);
     }
@@ -118,7 +118,7 @@ fn encode_commit(
             return Err("archive exceeds the 16 MiB limit".into());
         }
         if !system.reserve_memory(size.saturating_add(name.len() as u64).saturating_add(128))
-            || !system.charge_cpu(size.saturating_add(1))
+            || !system.checkpoint_cpu(size.saturating_add(1))
         {
             return Err("resource limit exceeded".into());
         }

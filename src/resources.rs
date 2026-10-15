@@ -86,6 +86,8 @@ pub struct CommandUsage {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RunOutcome {
     pub exit_status: i32,
+    /// Host cancellation ends this action without exhausting the persistent machine.
+    pub interrupted: bool,
     pub stop_reason: Option<StopReason>,
     pub limits: Limits,
     pub usage: Usage,
@@ -259,6 +261,7 @@ impl Resources {
 
     pub fn outcome(&self, exit_status: i32, disk_current: u64, disk_peak: u64) -> RunOutcome {
         RunOutcome {
+            interrupted: false,
             exit_status: self
                 .stop_reason
                 .map_or(exit_status, StopReason::exit_status),

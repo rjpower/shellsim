@@ -6,10 +6,54 @@ import socket
 import subprocess
 import sys
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
 import shellsim
+
+
+@pytest.mark.parametrize(
+    ("session", "source"),
+    [
+        (False, "while :; do :; done"),
+        (True, "awk 'BEGIN { while (1) {} }'"),
+        (True, "printf 'while (1) { a=a+1; }' | bc"),
+    ],
+)
+def test_cancellation_from_another_thread_preserves_the_machine(session: bool, source: str) -> None:
+    context = shellsim.Context()
+    environment = context.Environment(cpu=2**64 - 1)
+    runner = environment.create_shell() if session else environment
+    assert runner.run("value=kept").returncode == 0
+    token = shellsim.CancellationToken()
+    with ThreadPoolExecutor(max_workers=1) as worker:
+        pending = worker.submit(runner.run, source, cancellation=token)
+        token.cancel()
+        result = pending.result()
+    assert result.interrupted
+    assert result.returncode == 130
+    assert result.stop_reason is None
+    assert not environment.terminated
+    assert runner.run("printf '%s' \"$value\"").stdout == b"kept"
+    assert context.Environment().run("printf independent").stdout == b"independent"
+    with pytest.raises(shellsim.SimulationError):
+        runner.run("printf unexpected", cancellation=token)
+
+
+def test_cancelled_token_does_not_execute_or_cancel_later_actions() -> None:
+    environment = shellsim.Context().Environment()
+    token = shellsim.CancellationToken()
+    token.cancel()
+    result = environment.run("printf unexpected > /marker", cancellation=token)
+    assert result.interrupted
+    assert result.usage.cpu_used == 0
+    assert environment.run("test ! -e /marker").returncode == 0
+    completed = shellsim.CancellationToken()
+    assert environment.run("printf completed", cancellation=completed).stdout == b"completed"
+    completed.cancel()
+    assert not completed.cancelled
+    assert environment.run("printf later").stdout == b"later"
 
 
 def test_fresh_run_returns_bytes_and_structured_usage() -> None:
@@ -282,7 +326,9 @@ def test_container_host_can_stage_outside_workspace() -> None:
     guest.write_file("/opt/toolchain/include/example.h", b"#define VALUE 42\n")
 
     assert guest.read_file("/opt/toolchain/include/example.h") == b"#define VALUE 42\n"
-    assert guest.run("cat /opt/toolchain/include/example.h").stdout == b"#define VALUE 42\n"
+    result = guest.run("cat /opt/toolchain/include/example.h")
+    assert result.stdout == b"#define VALUE 42\n"
+    assert not result.interrupted
     with pytest.raises(shellsim.SimulationError):
         guest.write_file("/", b"not a file")
     assert guest.run("pwd").stdout == b"/work\n"

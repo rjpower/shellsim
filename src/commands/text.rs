@@ -509,7 +509,7 @@ fn cmd_seq(context: &mut ProcessContext<'_>, io: &mut Io) -> i32 {
     let mut x = start;
     let int = start.fract() == 0.0 && step.fract() == 0.0 && end.fract() == 0.0;
     let mut emit = |value| -> Result<(), i32> {
-        if !context.system.charge_cpu(1) {
+        if !context.system.checkpoint_cpu(1) {
             return Err(context.system.stop_status());
         }
         let line = fmt_num(value, int);
@@ -754,7 +754,7 @@ fn cmd_join(context: &mut ProcessContext<'_>, io: &mut Io) -> ShellPoll {
         .saturating_add(inputs[1].len());
     if !context
         .system
-        .charge_cpu(u64::try_from(comparison_work).unwrap_or(u64::MAX))
+        .checkpoint_cpu(u64::try_from(comparison_work).unwrap_or(u64::MAX))
     {
         return ShellPoll::Ready(context.system.stop_status());
     }
@@ -864,7 +864,7 @@ fn cmd_split(context: &mut ProcessContext<'_>, io: &mut Io) -> ShellPoll {
     let data_len = data.len();
     if !context
         .system
-        .charge_cpu(u64::try_from(data_len).unwrap_or(u64::MAX))
+        .checkpoint_cpu(u64::try_from(data_len).unwrap_or(u64::MAX))
     {
         return ShellPoll::Ready(context.system.stop_status());
     }
@@ -961,7 +961,7 @@ fn cmd_shuf(context: &mut ProcessContext<'_>, io: &mut Io) -> ShellPoll {
     }
     if !context
         .system
-        .charge_cpu(u64::try_from(data.len()).unwrap_or(u64::MAX))
+        .checkpoint_cpu(u64::try_from(data.len()).unwrap_or(u64::MAX))
     {
         return ShellPoll::Ready(context.system.stop_status());
     }
@@ -999,7 +999,7 @@ fn cmd_tsort(context: &mut ProcessContext<'_>, io: &mut Io) -> ShellPoll {
     }
     if !context
         .system
-        .charge_cpu(u64::try_from(data.len()).unwrap_or(u64::MAX))
+        .checkpoint_cpu(u64::try_from(data.len()).unwrap_or(u64::MAX))
     {
         return ShellPoll::Ready(context.system.stop_status());
     }

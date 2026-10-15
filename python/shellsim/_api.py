@@ -22,6 +22,7 @@ if TYPE_CHECKING:
     from .cpython import CPythonRuntime
 
 SimulationError = _native.SimulationError
+CancellationToken = _native.CancellationToken
 
 ToolHandler = Callable[[Mapping[str, Any]], Mapping[str, Any]]
 
@@ -129,6 +130,7 @@ class RunResult:
     stdout: bytes
     stderr: bytes
     stop_reason: Optional[str]
+    interrupted: bool
     limits: Limits
     usage: Usage
     command_usage: Tuple[CommandUsage, ...]
@@ -527,12 +529,22 @@ class Environment:
 
         return bool(self._native.terminated)
 
-    def run(self, source: str, stdin: Union[bytes, bytearray, memoryview] = b"") -> RunResult:
-        """Execute one complete shell action with an explicit input byte stream."""
+    def run(
+        self,
+        source: str,
+        stdin: Union[bytes, bytearray, memoryview] = b"",
+        *,
+        cancellation: Optional[CancellationToken] = None,
+    ) -> RunResult:
+        """Execute one shell action, optionally using a fresh host cancellation token.
+
+        Cancellation returns status 130 with ``interrupted=True`` after cleanup;
+        it preserves this machine and cumulative resource usage.
+        """
 
         if not isinstance(source, str):
             raise TypeError("source must be str")
-        metadata, stdout, stderr = self._native.run(source, _as_bytes("stdin", stdin))
+        metadata, stdout, stderr = self._native.run(source, _as_bytes("stdin", stdin), cancellation)
         return _decode_result(metadata, stdout, stderr)
 
     def create_shell(self) -> ShellSession:
@@ -545,6 +557,8 @@ class Environment:
         source: str,
         argv: Sequence[str] = (),
         stdin: Union[bytes, bytearray, memoryview] = b"",
+        *,
+        cancellation: Optional[CancellationToken] = None,
     ) -> RunResult:
         """Execute Python source directly in this environment.
 
@@ -563,7 +577,9 @@ class Environment:
         if self._cpython_runtime is None:
             raise SimulationError("select CPython with Context.Environment(pypi_packages=())")
         with phase("python.run"):
-            return self._cpython_runtime.run(self, ["-c", source, *arguments], stdin=input_bytes)
+            return self._cpython_runtime.run(
+                self, ["-c", source, *arguments], stdin=input_bytes, cancellation=cancellation
+            )
 
     def write_file(
         self,
@@ -924,12 +940,20 @@ class ShellSession:
         self._environment = environment
         self.pid = pid
 
-    def run(self, source: str, stdin: Union[bytes, bytearray, memoryview] = b"") -> RunResult:
-        """Execute one action in this shell, retaining its state for the next action."""
+    def run(
+        self,
+        source: str,
+        stdin: Union[bytes, bytearray, memoryview] = b"",
+        *,
+        cancellation: Optional[CancellationToken] = None,
+    ) -> RunResult:
+        """Execute one action, retaining shell state even after host cancellation."""
 
         if not isinstance(source, str):
             raise TypeError("source must be str")
-        metadata, stdout, stderr = self._environment._native.run_shell(self.pid, source, _as_bytes("stdin", stdin))
+        metadata, stdout, stderr = self._environment._native.run_shell(
+            self.pid, source, _as_bytes("stdin", stdin), cancellation
+        )
         return _decode_result(metadata, stdout, stderr)
 
 
@@ -943,6 +967,7 @@ def run(
     disk: Optional[int] = None,
     output: Optional[int] = None,
     http: Optional[Mapping[str, HttpResponse]] = None,
+    cancellation: Optional[CancellationToken] = None,
 ) -> RunResult:
     """Execute one action in a fresh environment."""
 
@@ -956,7 +981,7 @@ def run(
             output=output,
             http=http,
         )
-        .run(source, stdin)
+        .run(source, stdin, cancellation=cancellation)
     )
 
 
@@ -1028,6 +1053,7 @@ def _decode_result(metadata_json: str, stdout: bytes, stderr: bytes) -> RunResul
         stdout=stdout,
         stderr=stderr,
         stop_reason=outcome["stop_reason"],
+        interrupted=outcome["interrupted"],
         limits=limits,
         usage=usage,
         command_usage=command_usage,

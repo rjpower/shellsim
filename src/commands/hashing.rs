@@ -49,7 +49,7 @@ fn read_named(system: &mut dyn System, path: &str) -> Result<Vec<u8>, SyscallErr
 /// Charge for byte-oriented work that the old command dispatcher metered after execution.
 fn charge_input(system: &mut dyn System, length: usize) -> Result<(), ShellPoll> {
     let units = u64::try_from(length).unwrap_or(u64::MAX);
-    if system.charge_cpu(units) {
+    if system.checkpoint_cpu(units) {
         Ok(())
     } else {
         Err(ShellPoll::Ready(system.stop_status()))
@@ -69,19 +69,6 @@ fn hash_impl(context: &mut ProcessContext<'_>, algo: &str, io: &mut Io) -> Shell
             return poll;
         }
     }
-    let compute = |data: &[u8]| -> String {
-        match algo {
-            "sha256" => crate::hashes::sha256_hex(data),
-            "sha1" => crate::hashes::sha1_hex(data),
-            "sha512" => crate::hashes::sha512_hex(data),
-            "md5" => crate::hashes::md5_hex(data),
-            "crc32" => {
-                let (c, n) = crate::hashes::cksum(data);
-                format!("{c} {n}")
-            }
-            _ => String::new(),
-        }
-    };
     if check {
         let manifests = if ops.is_empty() {
             vec!["-"]
@@ -117,7 +104,10 @@ fn hash_impl(context: &mut ProcessContext<'_>, algo: &str, io: &mut Io) -> Shell
                         if let Err(poll) = charge_input(context.system, contents.len()) {
                             return poll;
                         }
-                        if compute(&contents) == expected {
+                        let Some(digest) = compute_hash(context.system, algo, &contents) else {
+                            return ShellPoll::Ready(130);
+                        };
+                        if digest == expected {
                             wln(io.out, &format!("{filename}: OK"));
                         } else {
                             wln(io.out, &format!("{filename}: FAILED"));
@@ -136,7 +126,10 @@ fn hash_impl(context: &mut ProcessContext<'_>, algo: &str, io: &mut Io) -> Shell
         if let Err(poll) = charge_input(context.system, io.stdin.len()) {
             return poll;
         }
-        wln(io.out, &format!("{}  -", compute(&io.stdin)));
+        let Some(digest) = compute_hash(context.system, algo, &io.stdin) else {
+            return ShellPoll::Ready(130);
+        };
+        wln(io.out, &format!("{digest}  -"));
         ShellPoll::Ready(0)
     } else {
         let mut status = 0;
@@ -146,7 +139,10 @@ fn hash_impl(context: &mut ProcessContext<'_>, algo: &str, io: &mut Io) -> Shell
                     if let Err(poll) = charge_input(context.system, data.len()) {
                         return poll;
                     }
-                    wln(io.out, &format!("{}  {}", compute(&data), f));
+                    let Some(digest) = compute_hash(context.system, algo, &data) else {
+                        return ShellPoll::Ready(130);
+                    };
+                    wln(io.out, &format!("{digest}  {f}"));
                 }
                 Err(error) => {
                     ewln(io.err, &format!("{algo}sum: {f}: {error}"));
@@ -156,6 +152,38 @@ fn hash_impl(context: &mut ProcessContext<'_>, algo: &str, io: &mut Io) -> Shell
         }
         ShellPoll::Ready(status)
     }
+}
+
+/// Keep each library call bounded while retaining the existing upfront CPU charge.
+fn compute_hash(system: &dyn System, algorithm: &str, data: &[u8]) -> Option<String> {
+    match algorithm {
+        "sha256" => digest_chunks::<sha2::Sha256>(system, data),
+        "sha1" => digest_chunks::<sha1::Sha1>(system, data),
+        "sha512" => digest_chunks::<sha2::Sha512>(system, data),
+        "md5" => digest_chunks::<md5::Md5>(system, data),
+        "crc32" => {
+            let mut hasher = crc32fast::Hasher::new();
+            for chunk in data.chunks(16 * 1024) {
+                if system.interrupted() {
+                    return None;
+                }
+                hasher.update(chunk);
+            }
+            Some(format!("{} {}", hasher.finalize(), data.len()))
+        }
+        _ => unreachable!("registered checksum algorithm"),
+    }
+}
+
+fn digest_chunks<D: sha2::Digest>(system: &dyn System, data: &[u8]) -> Option<String> {
+    let mut digest = D::new();
+    for chunk in data.chunks(16 * 1024) {
+        if system.interrupted() {
+            return None;
+        }
+        digest.update(chunk);
+    }
+    Some(crate::hashes::hex(&digest.finalize()))
 }
 
 fn cmd_base64(context: &mut ProcessContext<'_>, io: &mut Io) -> ShellPoll {

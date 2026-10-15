@@ -225,7 +225,7 @@ pub(crate) fn encode(system: &mut dyn System, entries: &[Entry]) -> Result<Vec<u
     if !system.reserve_memory(estimated as u64) {
         return Err("memory limit exceeded".to_string());
     }
-    if !system.charge_cpu(estimated as u64) {
+    if !system.checkpoint_cpu(estimated as u64) {
         return Err("resource limit exceeded".to_string());
     }
     let mut output = Vec::with_capacity(estimated);
@@ -375,7 +375,8 @@ fn decode(system: &mut dyn System, archive: &[u8]) -> Result<Vec<Entry>, String>
     if archive.len() > MAX_ARCHIVE_BYTES {
         return Err("archive exceeds the 16 MiB limit".to_string());
     }
-    if !system.reserve_memory(archive.len() as u64) || !system.charge_cpu(archive.len() as u64) {
+    if !system.reserve_memory(archive.len() as u64) || !system.checkpoint_cpu(archive.len() as u64)
+    {
         return Err("resource limit exceeded".to_string());
     }
     let mut entries = Vec::new();

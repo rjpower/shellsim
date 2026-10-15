@@ -316,7 +316,7 @@ fn process_reserved(
     let lines = text.split_inclusive('\n').collect::<Vec<_>>();
     let mut output = String::new();
     for (index, raw_line) in lines.iter().enumerate() {
-        if !system.charge_cpu(raw_line.len() as u64 + commands.len() as u64) {
+        if !system.checkpoint_cpu(raw_line.len() as u64 + commands.len() as u64) {
             return Err(system.stop_status());
         }
         let had_newline = raw_line.ends_with('\n');
@@ -344,9 +344,9 @@ fn process_reserved(
                     if !system.reserve_memory(bound) {
                         return Err(system.stop_status());
                     }
-                    if !system
-                        .charge_cpu((pattern.len() as u64).saturating_add(replacement.len() as u64))
-                    {
+                    if !system.checkpoint_cpu(
+                        (pattern.len() as u64).saturating_add(replacement.len() as u64),
+                    ) {
                         system.release_memory(bound);
                         return Err(system.stop_status());
                     }
@@ -422,7 +422,7 @@ fn push_line(
         let _ = system.charge_output(request);
         return Err(system.stop_status());
     }
-    if !system.reserve_memory(bytes) || !system.charge_cpu(bytes) {
+    if !system.reserve_memory(bytes) || !system.checkpoint_cpu(bytes) {
         return Err(system.stop_status());
     }
     output.push_str(text);

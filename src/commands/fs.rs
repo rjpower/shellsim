@@ -372,7 +372,7 @@ fn run_rm(context: &mut crate::program::ProcessContext<'_>, io: &mut Io) -> i32 
         let r = if recursive {
             system.walk(&cwd, t).and_then(|paths| {
                 for path in paths.into_iter().rev() {
-                    if !system.charge_cpu(1) {
+                    if !system.checkpoint_cpu(1) {
                         return Err(crate::syscalls::SyscallError::ResourceExhausted);
                     }
                     let node = system.metadata("/", &path, false)?;
@@ -1137,7 +1137,7 @@ fn run_du(context: &mut crate::program::ProcessContext<'_>, io: &mut Io) -> i32 
                 }
                 continue;
             };
-            if !system.charge_cpu(1) {
+            if !system.checkpoint_cpu(1) {
                 return 137;
             }
             let path = format!("{}/{name}", top.path.trim_end_matches('/'));
@@ -1359,7 +1359,7 @@ fn run_install(context: &mut crate::program::ProcessContext<'_>, io: &mut Io) ->
         }
         let mut status = 0;
         for path in operands {
-            if !system.charge_cpu(1) {
+            if !system.checkpoint_cpu(1) {
                 return system.stop_status();
             }
             if let Err(error) = system
@@ -1417,7 +1417,7 @@ fn run_install(context: &mut crate::program::ProcessContext<'_>, io: &mut Io) ->
                 continue;
             }
         };
-        if !system.charge_cpu(data.len() as u64) {
+        if !system.checkpoint_cpu(data.len() as u64) {
             return system.stop_status();
         }
         let result = if create_parents {
@@ -1549,7 +1549,7 @@ fn run_truncate(context: &mut crate::program::ProcessContext<'_>, io: &mut Io) -
             status = 1;
             continue;
         };
-        if !system.charge_cpu(new_len.saturating_sub(existing_size) as u64) {
+        if !system.checkpoint_cpu(new_len.saturating_sub(existing_size) as u64) {
             return system.stop_status();
         }
         let reservation = existing_size.max(new_len) as u64;
@@ -1735,7 +1735,7 @@ fn tree_directory(
         entries.retain(|entry| !entry.starts_with('.'));
     }
     for (position, entry) in entries.iter().enumerate() {
-        if !system.charge_cpu(1) {
+        if !system.checkpoint_cpu(1) {
             return system.stop_status();
         }
         let last = position + 1 == entries.len();

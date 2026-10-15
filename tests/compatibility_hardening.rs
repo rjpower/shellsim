@@ -21,6 +21,25 @@ fn text(source: &str) -> (i32, String, String) {
 }
 
 #[test]
+fn numeric_sort_preserves_ties_across_interruption_chunks() {
+    let mut environment = Environment::new();
+    let mut input = String::new();
+    for number in (0..600).rev() {
+        input.push_str(&format!("{number}:first\n{number}:second\n"));
+    }
+    environment
+        .vfs
+        .write("/", "/input", input.as_bytes(), 0o644)
+        .unwrap();
+    let (outcome, stdout, stderr) = environment.run_script_capture("sort -s -t: -k1n /input");
+    let expected = (0..600)
+        .map(|number| format!("{number}:first\n{number}:second\n"))
+        .collect::<String>();
+    assert_eq!(outcome.exit_status, 0, "{stderr:?}");
+    assert_eq!(stdout, expected.as_bytes());
+}
+
+#[test]
 fn unavailable_binaries_fail_and_remain_queryable() {
     let mut environment = Environment::new();
     let (outcome, stdout, stderr) = environment.run_script_capture("npm install package");

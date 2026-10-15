@@ -120,7 +120,7 @@ fn run_patch(
     if !system.reserve_memory(reserved) {
         return resource_failure(system, io);
     }
-    if !system.charge_cpu(bytes.len() as u64) {
+    if !system.checkpoint_cpu(bytes.len() as u64) {
         system.release_memory(reserved);
         return resource_failure(system, io);
     }
@@ -566,7 +566,7 @@ fn apply_file_patch(
     } else {
         Vec::new()
     };
-    if !system.charge_cpu(source_bytes.len() as u64) {
+    if !system.checkpoint_cpu(source_bytes.len() as u64) {
         return Err("resource limit exceeded".to_string());
     }
     let directive_delete = destination.is_none() && patch.hunks.is_empty();

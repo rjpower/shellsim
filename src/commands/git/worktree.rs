@@ -715,7 +715,7 @@ pub(crate) fn git_add(system: &mut dyn System, args: &[String], io: &mut Io) -> 
     } else {
         let units = (operands.len() as u64)
             .saturating_mul((index.len() as u64).saturating_add(work.len() as u64));
-        if !system.charge_cpu(units) {
+        if !system.checkpoint_cpu(units) {
             return repo::resource_error(system);
         }
         match selected_paths(&cwd, &root, &operands, &index, &work) {
@@ -1097,7 +1097,7 @@ pub(crate) fn git_mv(system: &mut dyn System, args: &[String], io: &mut Io) -> i
             // stages its target text and not the contents of the file at the end of it.
             let data = repo::read_work_file(system, &root, source_relative)
                 .ok_or_else(|| format!("cannot read '{source_relative}'"))?;
-            if !system.charge_cpu(data.len() as u64) {
+            if !system.checkpoint_cpu(data.len() as u64) {
                 return Err("cpu limit exceeded".to_string());
             }
             // A move keeps the file's mode along with its content.

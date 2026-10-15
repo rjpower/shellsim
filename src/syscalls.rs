@@ -80,6 +80,13 @@ pub(crate) enum SignalTarget {
 /// to the same operations; neither path receives host capabilities or the owning `Environment`.
 /// The borrowed handle cannot outlive the quantum, so blocked programs retain only owned state.
 pub(crate) trait System {
+    /// Observe host cancellation separately from permanent resource exhaustion.
+    fn interrupted(&self) -> bool;
+    /// Native work checks cancellation at its existing CPU-metered operation boundaries.
+    /// Cleanup uses the resource meter directly and does not call this helper.
+    fn checkpoint_cpu(&mut self, units: u64) -> bool {
+        !self.interrupted() && self.charge_cpu(units)
+    }
     fn pid(&self) -> crate::process::ProcessId;
     fn parent_pid(&self) -> crate::process::ProcessId;
     fn environment(&self) -> std::collections::BTreeMap<String, String>;
@@ -295,6 +302,10 @@ impl<'a> ActiveSystem<'a> {
 }
 
 impl System for ActiveSystem<'_> {
+    fn interrupted(&self) -> bool {
+        self.interp.interrupted()
+    }
+
     fn pid(&self) -> crate::process::ProcessId {
         self.interp.process.pid
     }
@@ -1069,10 +1080,10 @@ impl System for ActiveSystem<'_> {
     }
 
     fn stop_status(&self) -> i32 {
-        self.interp
-            .resources
-            .stop_reason()
-            .map_or(137, |reason| reason.exit_status())
+        self.interp.resources.stop_reason().map_or_else(
+            || if self.interrupted() { 130 } else { 137 },
+            |reason| reason.exit_status(),
+        )
     }
 
     fn note_unsupported(&mut self, feature: &str) {

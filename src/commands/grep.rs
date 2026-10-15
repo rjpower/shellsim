@@ -240,7 +240,7 @@ fn grep_impl_inner(
             return ShellPoll::Ready(context.system.stop_status());
         }
         *reserved_patterns = reserved_patterns.saturating_add(bytes_len);
-        if !context.system.charge_cpu(bytes_len) {
+        if !context.system.checkpoint_cpu(bytes_len) {
             return ShellPoll::Ready(context.system.stop_status());
         }
         let content = match String::from_utf8(bytes) {
@@ -401,7 +401,7 @@ fn grep_impl_inner(
     let mut total_matches = 0;
     let mut selected_file = false;
     for (label, data) in &inputs {
-        if !context.system.charge_cpu(data.len() as u64) {
+        if !context.system.checkpoint_cpu(data.len() as u64) {
             return ShellPoll::Ready(context.system.stop_status());
         }
         if !text_mode && data.contains(&0) {

@@ -99,7 +99,7 @@ fn run_dd(system: &mut dyn System, options: &Options, io: &mut Io) -> i32 {
             .min(input.len());
         &input[start..end]
     };
-    if !system.charge_cpu(u64::try_from(selected.len()).unwrap_or(u64::MAX)) {
+    if !system.checkpoint_cpu(u64::try_from(selected.len()).unwrap_or(u64::MAX)) {
         return system.stop_status();
     }
 

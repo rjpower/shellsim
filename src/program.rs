@@ -79,6 +79,14 @@ pub(crate) enum ProgramContinuation {
 }
 
 impl ProgramContinuation {
+    /// Unwind shell-local scopes as well as native execution reservations on termination.
+    pub(crate) fn terminate(&mut self, interp: &mut Interp) {
+        match self {
+            Self::Shell(shell) => shell.abort(interp),
+            Self::Native(_) => self.release_owned_memory(interp),
+        }
+    }
+
     /// Return outstanding input reservations when a process exits before consuming EOF.
     pub(crate) fn release_owned_memory(&mut self, interp: &mut Interp) {
         if let Self::Native(NativeProcess::SystemCommand(command)) = self {
@@ -497,6 +505,10 @@ mod tests {
     }
 
     impl System for PartialWriter {
+        fn interrupted(&self) -> bool {
+            false
+        }
+
         fn environment(&self) -> std::collections::BTreeMap<String, String> {
             std::collections::BTreeMap::new()
         }

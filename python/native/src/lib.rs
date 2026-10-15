@@ -80,6 +80,31 @@ struct NativeEnvironment {
     environment: Mutex<shellsim::Environment>,
 }
 
+/// One host request, independent of the mutex held by the running simulator.
+#[pyclass(name = "CancellationToken", module = "shellsim")]
+struct NativeCancellationToken {
+    token: shellsim::CancellationToken,
+}
+
+#[pymethods]
+impl NativeCancellationToken {
+    #[new]
+    fn new() -> Self {
+        Self {
+            token: shellsim::CancellationToken::new(),
+        }
+    }
+
+    fn cancel(&self) {
+        self.token.cancel();
+    }
+
+    #[getter]
+    fn cancelled(&self) -> bool {
+        self.token.is_cancelled()
+    }
+}
+
 /// Installed files and launcher settings, without an executing machine's state.
 #[pyclass(module = "shellsim._native")]
 struct NativeImage {
@@ -568,17 +593,22 @@ impl NativeEnvironment {
     }
 
     /// Execute one shell action and return JSON metadata plus byte-preserving output streams.
+    #[pyo3(signature = (source, stdin, cancellation=None))]
     fn run(
         &self,
         py: Python<'_>,
         source: String,
         stdin: Vec<u8>,
+        cancellation: Option<PyRef<'_, NativeCancellationToken>>,
     ) -> PyResult<(String, Py<PyBytes>, Py<PyBytes>)> {
+        let token = cancellation.map(|request| request.token.clone());
         let (metadata, stdout, stderr) = py
             .detach(|| {
                 let mut environment = self.lock_environment()?;
                 on_worker(&mut environment, move |environment| {
-                    Ok(run_action(environment, &source, &stdin))
+                    with_cancellation(environment, token.as_ref(), |environment| {
+                        Ok(run_action(environment, &source, &stdin))
+                    })
                 })
             })
             .map_err(SimulationError::new_err)?;
@@ -603,21 +633,26 @@ impl NativeEnvironment {
     }
 
     /// Execute one action in a selected persistent shell session.
+    #[pyo3(signature = (pid, source, stdin, cancellation=None))]
     fn run_shell(
         &self,
         py: Python<'_>,
         pid: u32,
         source: String,
         stdin: Vec<u8>,
+        cancellation: Option<PyRef<'_, NativeCancellationToken>>,
     ) -> PyResult<(String, Py<PyBytes>, Py<PyBytes>)> {
+        let token = cancellation.map(|request| request.token.clone());
         let (metadata, stdout, stderr) = py
             .detach(|| {
                 let mut environment = self.lock_environment()?;
                 on_worker(&mut environment, move |environment| {
-                    let start = metadata_start(environment);
-                    let (outcome, stdout, stderr) =
-                        environment.run_shell_session_capture_with_stdin(pid, &source, &stdin)?;
-                    Ok((metadata_finish(environment, outcome, start), stdout, stderr))
+                    with_cancellation(environment, token.as_ref(), |environment| {
+                        let start = metadata_start(environment);
+                        let (outcome, stdout, stderr) = environment
+                            .run_shell_session_capture_with_stdin(pid, &source, &stdin)?;
+                        Ok((metadata_finish(environment, outcome, start), stdout, stderr))
+                    })
                 })
             })
             .map_err(SimulationError::new_err)?;
@@ -830,6 +865,18 @@ fn run_action(
     (metadata_finish(environment, outcome, start), stdout, stderr)
 }
 
+/// Keep token binding inside the worker and clear it even when a session rejects an action.
+fn with_cancellation<T>(
+    environment: &mut shellsim::Environment,
+    token: Option<&shellsim::CancellationToken>,
+    action: impl FnOnce(&mut shellsim::Environment) -> Result<T, String>,
+) -> Result<T, String> {
+    match token {
+        Some(token) => environment.with_cancellation(token, action)?,
+        None => action(environment),
+    }
+}
+
 fn metadata_start(environment: &shellsim::Environment) -> MetadataStart {
     MetadataStart {
         command: environment.cmd_trace.len(),
@@ -1035,6 +1082,7 @@ fn register_trusted_precompiled_wasm_file(
 
 #[pymodule]
 fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
+    module.add_class::<NativeCancellationToken>()?;
     module.add_class::<NativeEnvironment>()?;
     module.add_class::<NativeImage>()?;
     module.add_class::<NativeContainer>()?;

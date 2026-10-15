@@ -188,7 +188,7 @@ fn transform(
     level: u32,
     input: &[u8],
 ) -> Result<Vec<u8>, String> {
-    if !system.charge_cpu(u64::try_from(input.len()).unwrap_or(u64::MAX)) {
+    if !system.checkpoint_cpu(u64::try_from(input.len()).unwrap_or(u64::MAX)) {
         return Err("resource limit exceeded".to_string());
     }
     match operation {
@@ -205,25 +205,42 @@ fn transform(
                 .mtime(0)
                 .write(Vec::with_capacity(bound), Compression::new(level));
             let mut encoder = encoder;
-            encoder
-                .write_all(input)
-                .map_err(|error| error.to_string())?;
+            for chunk in input.chunks(16 * 1024) {
+                if system.interrupted() {
+                    return Err("compression interrupted".to_string());
+                }
+                encoder
+                    .write_all(chunk)
+                    .map_err(|error| error.to_string())?;
+            }
             encoder.finish().map_err(|error| error.to_string())
         }
         Operation::Decompress => {
             if !system.reserve_memory(MAX_DECOMPRESSED_BYTES as u64) {
                 return Err("memory limit exceeded".to_string());
             }
-            let decoder = MultiGzDecoder::new(input);
+            let mut decoder = MultiGzDecoder::new(input);
             let mut output = Vec::new();
-            decoder
-                .take((MAX_DECOMPRESSED_BYTES + 1) as u64)
-                .read_to_end(&mut output)
-                .map_err(|error| error.to_string())?;
+            let mut buffer = [0; 16 * 1024];
+            loop {
+                if system.interrupted() {
+                    return Err("decompression interrupted".to_string());
+                }
+                let count = decoder
+                    .read(&mut buffer)
+                    .map_err(|error| error.to_string())?;
+                if count == 0 {
+                    break;
+                }
+                if output.len().saturating_add(count) > MAX_DECOMPRESSED_BYTES {
+                    return Err("decompressed output exceeds the 16 MiB limit".to_string());
+                }
+                output.extend_from_slice(&buffer[..count]);
+            }
             if output.len() > MAX_DECOMPRESSED_BYTES {
                 return Err("decompressed output exceeds the 16 MiB limit".to_string());
             }
-            if !system.charge_cpu(u64::try_from(output.len()).unwrap_or(u64::MAX)) {
+            if !system.checkpoint_cpu(u64::try_from(output.len()).unwrap_or(u64::MAX)) {
                 return Err("resource limit exceeded".to_string());
             }
             Ok(output)

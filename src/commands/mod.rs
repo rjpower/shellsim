@@ -979,28 +979,11 @@ pub(crate) fn parse_shell_source(
     source: &str,
     err: &mut Vec<u8>,
 ) -> Result<crate::shell::Node, i32> {
-    let parser_memory = 8 * 1024 + (source.len() as u64).saturating_mul(2);
-    if !interp.resources.reserve_memory(parser_memory) {
-        return Err(interp
-            .resources
-            .stop_reason()
-            .map_or(137, |reason| reason.exit_status()));
-    }
-    let parsed = if interp.resources.charge_cpu(source.len() as u64) {
-        crate::shell::parse(source).map_err(|error| error.to_string())
-    } else {
-        Err(String::new())
-    };
-    interp.resources.release_memory(parser_memory);
-    match parsed {
+    match interp.parse_shell_action(source) {
         Ok(ast) => Ok(ast),
-        Err(error) if error.is_empty() => Err(interp
-            .resources
-            .stop_reason()
-            .map_or(137, |reason| reason.exit_status())),
-        Err(error) => {
-            util::ewln(err, &format!("shellsim: syntax error: {error}"));
-            Err(2)
+        Err((status, diagnostic)) => {
+            err.extend_from_slice(&diagnostic);
+            Err(status)
         }
     }
 }
