@@ -1937,8 +1937,13 @@ impl Interp {
                 .map_or(137, |reason| reason.exit_status());
             return Err((status, Vec::new()));
         }
+        let cancellation = self.cancellation.token.clone().filter(|_| {
+            self.cancellation
+                .generation
+                .is_none_or(|generation| self.process.action_generation == generation)
+        });
         let parsed = if self.resources.charge_cpu(src.len() as u64) {
-            parse_with_cancellation(src, self.cancellation.token.clone())
+            parse_with_cancellation(src, cancellation)
                 .map_err(|error| (2, format!("shellsim: syntax error: {error}\n").into_bytes()))
         } else {
             Err((
@@ -1949,6 +1954,7 @@ impl Interp {
             ))
         };
         self.resources.release_memory(parser_memory);
+        // Cancellation may end lexing at EOF; never execute that partial syntax tree.
         if self.interrupted() {
             self.cancellation.interrupted.set(true);
             return Err((130, Vec::new()));

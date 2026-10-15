@@ -149,7 +149,9 @@ fn a_failed_reap_still_unwinds_and_restores_the_target_shell() {
 #[test]
 fn an_older_native_job_does_not_observe_a_later_actions_token() {
     let mut environment = Environment::new();
-    environment.run_script_capture("(sleep 1; awk 'BEGIN { print \"older\" }' > /older) &");
+    environment.run_script_capture(
+        "(sleep 1; eval 'printf eval:'; awk 'BEGIN { print \"older\" }') > /older &",
+    );
     let token = CancellationToken::new();
     environment
         .with_cancellation(&token, |environment| {
@@ -166,7 +168,10 @@ fn an_older_native_job_does_not_observe_a_later_actions_token() {
                     break;
                 }
             }
-            assert_eq!(environment.vfs.read("/", "/older").unwrap(), b"older\n");
+            assert_eq!(
+                environment.vfs.read("/", "/older").unwrap(),
+                b"eval:older\n"
+            );
             assert_eq!(
                 execution.poll(environment, false).unwrap(),
                 MachinePoll::Ready(130)
@@ -181,4 +186,31 @@ fn an_older_native_job_does_not_observe_a_later_actions_token() {
         environment.run_script_capture("printf reusable").1,
         b"reusable"
     );
+}
+
+#[test]
+fn native_interpreter_loops_stop_at_interior_checkpoints_and_leave_cpu_available() {
+    for body in [
+        "awk 'BEGIN { while (1) {} }'",
+        "printf 'while (1) { a=a+1; }' | bc",
+    ] {
+        let mut environment = Environment::with_limits(crate::Limits {
+            cpu: 100_000,
+            ..crate::Limits::default()
+        });
+        let token = CancellationToken::after_native_checks(256);
+        let source = format!("printf started > /started; {body}");
+        let (outcome, _, stderr) = environment
+            .with_cancellation(&token, |environment| {
+                environment.run_script_capture(&source)
+            })
+            .unwrap();
+        assert!(outcome.interrupted, "{body}: {stderr:?}");
+        assert_eq!(outcome.exit_status, 130);
+        assert!(outcome.stop_reason.is_none());
+        assert_eq!(environment.vfs.read("/", "/started").unwrap(), b"started");
+        let (next, stdout, _) = environment.run_script_capture("printf usable");
+        assert_eq!(next.exit_status, 0);
+        assert_eq!(stdout, b"usable");
+    }
 }

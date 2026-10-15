@@ -237,9 +237,6 @@ fn transform(
                 }
                 output.extend_from_slice(&buffer[..count]);
             }
-            if output.len() > MAX_DECOMPRESSED_BYTES {
-                return Err("decompressed output exceeds the 16 MiB limit".to_string());
-            }
             if !system.checkpoint_cpu(u64::try_from(output.len()).unwrap_or(u64::MAX)) {
                 return Err("resource limit exceeded".to_string());
             }

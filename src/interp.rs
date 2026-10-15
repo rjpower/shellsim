@@ -2832,6 +2832,10 @@ impl Environment {
     /// remain independent, so an interrupted action does not poison subsequent runs.
     /// A positive check records that this action observed the request before completion.
     pub fn interrupted(&self) -> bool {
+        #[cfg(test)]
+        if let Some(token) = &self.cancellation.token {
+            token.native_checkpoint();
+        }
         let requested = self.cancellation_requested()
             && self
                 .cancellation

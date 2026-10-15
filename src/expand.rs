@@ -133,8 +133,8 @@ struct Part {
 /// Charge `bytes` of expansion output to the machine memory budget before it is used.
 ///
 /// The charge lasts until the next shell node starts (see
-/// [`Interp::release_expansion_memory`]). On failure the machine stops with
-/// `MemoryExhausted` and expansion produces nothing further.
+/// [`Interp::release_expansion_memory`]). Memory exhaustion stops the machine;
+/// cancellation stops only this action. Either case suppresses further expansion.
 fn charge_expansion(interp: &mut Interp, bytes: usize) -> bool {
     if interp.interrupted() {
         return false;

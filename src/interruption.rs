@@ -19,6 +19,8 @@ struct State {
     finished: AtomicBool,
     wake: Condvar,
     waiting: Mutex<()>,
+    #[cfg(test)]
+    cancel_after_native_checks: std::sync::atomic::AtomicUsize,
 }
 
 /// A host action's binding is deliberately absent from a machine snapshot.
@@ -66,6 +68,31 @@ impl CancellationToken {
     pub(crate) fn finish(&self) {
         let _waiting = self.0.waiting.lock().expect("cancellation wait lock");
         self.0.finished.store(true, Ordering::Release);
+    }
+
+    // A native interpreter does not return to the scheduler inside its evaluation loop.
+    // Unit regressions request cancellation at a fixed kernel checkpoint instead of racing
+    // a host timer; the installed-package regression separately exercises thread delivery.
+    #[cfg(test)]
+    pub(crate) fn after_native_checks(checks: usize) -> Self {
+        let token = Self::new();
+        token
+            .0
+            .cancel_after_native_checks
+            .store(checks, Ordering::Relaxed);
+        token
+    }
+
+    #[cfg(test)]
+    pub(crate) fn native_checkpoint(&self) {
+        if self.0.cancel_after_native_checks.fetch_update(
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+            |remaining| remaining.checked_sub(1),
+        ) == Ok(1)
+        {
+            self.0.requested.store(true, Ordering::Release);
+        }
     }
 
     /// A real-time driver may sleep, but a host cancellation must wake it immediately.
