@@ -43,8 +43,11 @@ def test_s3_publication_retains_http_metadata_and_directory_indexes(tmp_path, mo
         elif method == "complete_multipart_upload":
             objects[key] = uploads.pop(key)
         elif method == "copy_object":
-            source = fields["CopySource"]
-            objects[key] = {**fields, "Body": objects[source["Bucket"] + "/" + source["Key"]]["Body"]}
+            reference = fields["CopySource"]
+            source = objects[reference["Bucket"] + "/" + reference["Key"]]
+            objects[key] = (
+                {**fields, "Body": source["Body"]} if fields.get("MetadataDirective") == "REPLACE" else source.copy()
+            )
         else:
             raise AssertionError(method)
         return {"ETag": '"test"'}
@@ -65,7 +68,11 @@ def test_s3_publication_retains_http_metadata_and_directory_indexes(tmp_path, mo
     else:
         prefix = "s3://build-store"
         if source_kind == "same-cloud":
-            objects["build-store/" + relative] = {"Body": payload}
+            objects["build-store/" + relative] = {
+                "Body": payload,
+                "ContentType": "text/plain",
+                "CacheControl": "no-store",
+            }
         else:
             other.pipe_file("build-store/" + relative, payload)
     original = buckets.filesystem_for
