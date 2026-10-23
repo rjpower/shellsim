@@ -26,6 +26,21 @@ assets with `--output <prefix> --copy-assets`; `--asset-output <shared-prefix>` 
 catalogs from shared assets. Serve the store with `s3_proxy.py --prefix <prefix>` and pass the catalog URL to
 `Context(pypi_catalog="<URL>").Environment(pypi_packages=["scipy"])`; no patched uv is needed.
 
+For public hosting, export to an R2 bucket connected to a custom domain:
+
+```sh
+uv run --extra buildomatic python -m ports export \
+  --output s3://marin-na-public/shellsim/ports \
+  --url-prefix https://public.oa.dev/shellsim/ports --copy-assets --simple
+```
+
+Rigging must declare the R2 bucket and endpoint; only the publisher needs its
+credentials. S3 uploads include HTTP content types and cache policies: assets
+are immutable for one year, while catalogs and indexes require revalidation.
+Package indexes also publish directory URL objects, so `/simple/<name>/` works
+without a proxy or URL rewrite. Configure the domain cache to respect origin
+headers and cache package file types.
+
 Delivery adds checked-hash `.pyc` files to wheels and the stdlib using the declared
 WASI CPython producer, with source files retained and wheel RECORDs updated. Bytecode
 delivery keys include that producer; cache hits prune its build-only prerequisites.

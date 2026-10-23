@@ -16,6 +16,88 @@ from ports.buildomatic.delivery import DeliveryStore, export
 from ports.buildomatic.delivery_products import publish_product
 
 
+@pytest.mark.parametrize("source_kind", ["local", "other-cloud", "same-cloud"])
+def test_s3_publication_retains_http_metadata_and_directory_indexes(tmp_path, monkeypatch, source_kind):
+    """Inspect the S3 wire boundary so uploads and server-side copies agree."""
+    import s3fs
+    from fsspec.asyn import sync
+    from fsspec.implementations.memory import MemoryFileSystem
+    from rigging.filesystem import buckets
+
+    objects = {}
+    uploads = {}
+    destination = s3fs.S3FileSystem(key="test", secret="test", skip_instance_cache=True)
+
+    async def call_s3(method, *args, **kwargs):
+        fields = {**dict(pair for options in args for pair in options.items()), **kwargs}
+        key = fields["Bucket"] + "/" + fields["Key"]
+        if method == "head_object":
+            return {"ContentLength": len(objects[key]["Body"]), "ETag": '"test"', "LastModified": None}
+        if method == "put_object":
+            objects[key] = fields
+        elif method == "create_multipart_upload":
+            uploads[key] = {**fields, "Body": b""}
+            return {"UploadId": key}
+        elif method == "upload_part":
+            uploads[key]["Body"] += fields["Body"]
+        elif method == "complete_multipart_upload":
+            objects[key] = uploads.pop(key)
+        elif method == "copy_object":
+            source = fields["CopySource"]
+            objects[key] = {**fields, "Body": objects[source["Bucket"] + "/" + source["Key"]]["Body"]}
+        else:
+            raise AssertionError(method)
+        return {"ETag": '"test"'}
+
+    monkeypatch.setattr(destination, "_call_s3", call_s3)
+    monkeypatch.setattr(
+        destination, "call_s3", lambda *args, **kwargs: sync(destination.loop, call_s3, *args, **kwargs)
+    )
+    monkeypatch.setattr(destination, "exists", lambda key: key in objects)
+    other = MemoryFileSystem(skip_instance_cache=True)
+    local = tmp_path / "build-store"
+    payload = b"release package bytes"
+    relative = "assets/build-key/package.whl"
+    if source_kind == "local":
+        (local / "assets/build-key").mkdir(parents=True)
+        (local / relative).write_bytes(payload)
+        prefix = str(local)
+    else:
+        prefix = "s3://build-store"
+        if source_kind == "same-cloud":
+            objects["build-store/" + relative] = {"Body": payload}
+        else:
+            other.pipe_file("build-store/" + relative, payload)
+    original = buckets.filesystem_for
+
+    def filesystem_for(url):
+        if url.startswith("s3://public/"):
+            return destination, url.removeprefix("s3://")
+        if url == prefix and source_kind != "local":
+            return destination if source_kind == "same-cloud" else other, "build-store"
+        return original(url)
+
+    monkeypatch.setattr(buckets, "filesystem_for", filesystem_for)
+    package = {"name": "package", "filename": "package.whl", "path": relative, "requires_python": None}
+    (tmp_path / "graph.json").write_text(json.dumps({"packages": [package], "native": []}))
+    (tmp_path / "results.json").write_text(json.dumps({"prefix": prefix}))
+    result = export(tmp_path, "s3://public/ports", "https://public.example/ports", copy_assets=True, simple=True)
+    assert result["assets_copied"] == 1
+    asset = objects["public/ports/" + relative]
+    assert asset["Body"] == payload
+    assert asset["ContentType"] == "application/octet-stream"
+    assert asset["CacheControl"] == "public, max-age=31536000, immutable"
+    catalog = objects["public/ports/catalog.json"]
+    assert catalog["ContentType"] == "application/json" and catalog["CacheControl"] == "no-cache"
+    assert json.loads(catalog["Body"])["packages"][0]["url"] == "https://public.example/ports/" + relative
+    index = objects["public/ports/simple/package/"]
+    assert index["ContentType"] == "text/html" and index["CacheControl"] == "no-cache"
+    assert index["Body"] == objects["public/ports/simple/package/index.html"]["Body"]
+    assert b'href="https://public.example/ports/assets/build-key/package.whl"' in index["Body"]
+    assert objects["public/ports/simple/"]["Body"] == objects["public/ports/simple/index.html"]["Body"]
+    assert export(tmp_path, "s3://public/ports", "https://public.example/ports", copy_assets=True)["assets_copied"] == 0
+
+
 @pytest.fixture
 def built(tmp_path):
     ports, store = tmp_path / "ports", tmp_path / "store"
