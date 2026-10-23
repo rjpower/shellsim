@@ -73,9 +73,16 @@ class DeliveryStore:
             options = upload_options(self.scheme, relative)
             self.fs.pipe_file(key, value, **options)
             if self.scheme == "s3" and relative.endswith("/index.html"):
-                # Object storage has no directory-index lookup. Publish the same
-                # page at the URL used by ordinary package-index clients.
-                self.fs.pipe_file(key.removesuffix("index.html"), value, **options)
+                # Filesystem APIs may strip a trailing slash. The index URL
+                # needs an exact S3 key because R2 has no directory lookup.
+                bucket, _, object_key = key.partition("/")
+                self.fs.call_s3(
+                    "put_object",
+                    Bucket=bucket,
+                    Key=object_key.removesuffix("index.html"),
+                    Body=value,
+                    **options,
+                )
 
     def emit(self, source: Path, relative: str) -> None:
         if self.exists(relative):

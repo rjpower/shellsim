@@ -27,6 +27,9 @@ def test_s3_publication_retains_http_metadata_and_directory_indexes(tmp_path, mo
     objects = {}
     uploads = {}
     destination = s3fs.S3FileSystem(key="test", secret="test", skip_instance_cache=True)
+    split_path = destination.split_path
+    # Marin's fsspec 2026.1 treats trailing slashes as directory syntax.
+    monkeypatch.setattr(destination, "split_path", lambda path: split_path(path.rstrip("/")))
 
     async def call_s3(method, *args, **kwargs):
         fields = {**dict(pair for options in args for pair in options.items()), **kwargs}
