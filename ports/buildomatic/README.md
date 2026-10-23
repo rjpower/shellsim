@@ -40,6 +40,8 @@ are immutable for one year, while catalogs and indexes require revalidation.
 Package indexes also publish directory URL objects, so `/simple/<name>/` works
 without a proxy or URL rewrite. Configure the domain cache to respect origin
 headers and cache package file types.
+Populate and verify this public location before releasing a client that uses
+it as `DEFAULT_PYPI_CATALOG`.
 
 Delivery adds checked-hash `.pyc` files to wheels and the stdlib using the declared
 WASI CPython producer, with source files retained and wheel RECORDs updated. Bytecode

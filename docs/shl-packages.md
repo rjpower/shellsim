@@ -187,7 +187,7 @@ def submit_grade(arguments):
     scores.append(arguments["score"])
     return {"accepted": True}
 
-ctx = shellsim.Context(pypi_catalog="https://shellsim.rjp.io/ports/catalog.json")
+ctx = shellsim.Context(pypi_catalog="https://public.oa.dev/shellsim/ports/catalog.json")
 container = ctx.Environment(pypi_packages=()).to_container(tools={
     "workspace.read_file": read_file,
     "conversation.list": list_conversation,
