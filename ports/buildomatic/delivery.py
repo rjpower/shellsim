@@ -6,6 +6,7 @@ import errno
 import html
 import json
 import logging
+import mimetypes
 import shutil
 import tempfile
 from concurrent.futures import ThreadPoolExecutor
@@ -17,6 +18,17 @@ from ports._support.graph import Graph, guest_graph
 from ports._support.store import relative_path
 
 logger = logging.getLogger(__name__)
+
+
+def upload_options(scheme: str, relative: str) -> dict:
+    """Keep public assets cacheable and mutable catalog metadata revalidated."""
+    content_type = mimetypes.guess_type(relative)[0] or "application/octet-stream"
+    cache_control = "public, max-age=31536000, immutable" if relative.startswith("assets/") else "no-cache"
+    if scheme == "s3":
+        return {"ContentType": content_type, "CacheControl": cache_control}
+    if scheme == "gs":
+        return {"content_type": content_type, "fixed_key_metadata": {"cache_control": cache_control}}
+    return {}
 
 
 class DeliveryStore:
@@ -57,7 +69,20 @@ class DeliveryStore:
 
             atomic_write(self.local / relative_path(relative), value)
         else:
-            self.fs.pipe_file(self.key(relative), value)
+            key = self.key(relative)
+            options = upload_options(self.scheme, relative)
+            self.fs.pipe_file(key, value, **options)
+            if self.scheme == "s3" and relative.endswith("/index.html"):
+                # Filesystem APIs may strip a trailing slash. The index URL
+                # needs an exact S3 key because R2 has no directory lookup.
+                bucket, _, object_key = key.partition("/")
+                self.fs.call_s3(
+                    "put_object",
+                    Bucket=bucket,
+                    Key=object_key.removesuffix("index.html"),
+                    Body=value,
+                    **options,
+                )
 
     def emit(self, source: Path, relative: str) -> None:
         if self.exists(relative):
@@ -75,7 +100,7 @@ class DeliveryStore:
                 with staged_file(destination) as temporary:
                     shutil.copyfile(source, temporary)
         else:
-            self.fs.put_file(str(source), self.key(relative))
+            self.fs.put_file(str(source), self.key(relative), **upload_options(self.scheme, relative))
 
     def promote(self, relative: str, destination: DeliveryStore) -> bool:
         """Copy only missing assets; same-backend S3 copies stay server-side."""
@@ -83,7 +108,12 @@ class DeliveryStore:
         if destination.exists(relative):
             return False
         if self.fs is not None and self.fs is destination.fs and self.scheme == "s3":
-            self.fs.cp_file(self.key(relative), destination.key(relative))
+            self.fs.cp_file(
+                self.key(relative),
+                destination.key(relative),
+                MetadataDirective="REPLACE",
+                **upload_options(destination.scheme, relative),
+            )
             return True
         if self.local is not None:
             destination.emit(self.local / relative, relative)
@@ -95,7 +125,9 @@ class DeliveryStore:
         else:
             with self.fs.open(self.key(relative), "rb", block_size=8 * 1024**2) as source:
                 with destination.fs.transaction:
-                    with destination.fs.open(destination.key(relative), "wb") as target:
+                    with destination.fs.open(
+                        destination.key(relative), "wb", **upload_options(destination.scheme, relative)
+                    ) as target:
                         shutil.copyfileobj(source, target, length=1024**2)
         return True
 
